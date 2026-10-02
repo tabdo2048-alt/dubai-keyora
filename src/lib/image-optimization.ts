@@ -1,12 +1,23 @@
-const FULL_MAX_DIMENSION = 1920;
-const THUMB_MAX_DIMENSION = 480;
-const FULL_QUALITY = 0.82;
-const THUMB_QUALITY = 0.72;
+const FULL_MAX_DIMENSION = 1600;
+const THUMB_MAX_DIMENSION = 360;
+const FULL_QUALITY = 0.78;
+const THUMB_QUALITY = 0.68;
 
 export type OptimizedProjectImage = {
   full: File;
   thumbnail: File | null;
 };
+
+export async function imageContentHash(file: Blob): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function formatImageBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
 
 /**
  * Convert an uploaded raster image to a reasonably sized WebP (or JPEG when

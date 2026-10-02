@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { emptyFilters, type ProjectFilters } from "@/lib/types";
-import type { LightPreset } from "@/components/map/MapboxView";
+import type { LightPreset } from "@/components/map/mapTypes";
 import type { ZoneCategory } from "@/lib/zones";
 
 type MapMode = "satellite" | "3d";
@@ -46,6 +46,7 @@ type FiltersStore = {
   // once its id is added here (via the eye toggle in the sidebar).
   visibleProjectIds: Set<string>;
   toggleProjectVisible: (id: string) => void;
+  showAllProjects: (ids: string[]) => void;
 
   // Project zones (plot boundaries) pinned visible on the map. While an id is
   // here its colored plot stays drawn regardless of hover/selection.
@@ -70,6 +71,8 @@ export const useFiltersStore = create<FiltersStore>((set) => ({
   hoveredProjectId: null,
   setHoveredProjectId: (id) => set({ hoveredProjectId: id }),
 
+  // Open on the reliable Mapbox satellite view. Cesium remains available from
+  // the 3D toggle, but it should never replace the product's default map.
   mapMode: "satellite",
   setMapMode: (mode) => set({ mapMode: mode }),
 
@@ -102,6 +105,13 @@ export const useFiltersStore = create<FiltersStore>((set) => ({
     if (next.has(id)) next.delete(id);
     else next.add(id);
     return { visibleProjectIds: next };
+  }),
+  showAllProjects: (ids) => set({
+    filters: emptyFilters,
+    visibleProjectIds: new Set(ids),
+    // Place browsing intentionally hides projects. Showing every project is an
+    // explicit request to leave that mode as well as reveal every marker/model.
+    activeCategories: new Set(),
   }),
 
   pinnedPlotIds: new Set(),

@@ -8,8 +8,10 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-const MONTHLY_PRICE_AED_FILS = 10000; // 100.00 AED (Stripe amounts are in the minor unit)
-const YEARLY_PRICE_AED_FILS = 100000; // 1,000.00 AED per year
+const MONTHLY_PRICE_AED_FILS = 3000; // 30.00 AED (Stripe amounts are in the minor unit)
+const YEARLY_PRICE_AED_FILS = 30000; // 300.00 AED per year
+const LEGACY_MONTHLY_PRICE_AED_FILS = 10000;
+const LEGACY_YEARLY_PRICE_AED_FILS = 100000;
 const CURRENCY = "aed";
 const PRODUCT_NAME = "Dubai SkyView — Subscription";
 type BillingPeriod = "month" | "year";
@@ -55,15 +57,18 @@ async function buildCheckoutLineItem(stripe: Awaited<ReturnType<typeof stripeCli
 
   if (priceId) {
     const price = await stripe.prices.retrieve(priceId);
-    if (
-      !price.active ||
-      price.currency !== CURRENCY ||
-      price.unit_amount !== expectedAmount ||
-      price.recurring?.interval !== period
-    ) {
+    if (price.currency !== CURRENCY || price.recurring?.interval !== period) {
       throw new Error("Billing price configuration is invalid");
     }
-    return { price: price.id, quantity: 1 };
+    if (price.unit_amount === expectedAmount) {
+      if (!price.active) throw new Error("Billing price configuration is invalid");
+      return { price: price.id, quantity: 1 };
+    }
+    // Existing Stripe Price IDs cannot have their amount changed. An old ID
+    // may still be configured during rollout; use the new amount inline until
+    // it is replaced, without silently accepting another misconfigured price.
+    const legacyAmount = period === "year" ? LEGACY_YEARLY_PRICE_AED_FILS : LEGACY_MONTHLY_PRICE_AED_FILS;
+    if (price.unit_amount !== legacyAmount) throw new Error("Billing price configuration is invalid");
   }
 
   return {
@@ -218,7 +223,7 @@ export const createCheckoutSession = createServerFn({ method: "POST" })
       },
       // Repeated clicks in the same minute return the same Checkout Session
       // instead of creating multiple subscriptions.
-      { idempotencyKey: `tenant-checkout-${tenant.id}-${data.period}-${Math.floor(Date.now() / 60_000)}` },
+      { idempotencyKey: `tenant-checkout-${tenant.id}-${data.period}-${expectedPrice(data.period)}-${Math.floor(Date.now() / 60_000)}` },
     );
 
     return { url: session.url };

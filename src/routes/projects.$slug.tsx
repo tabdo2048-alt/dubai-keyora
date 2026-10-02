@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, Outlet, useRouterState } from "@tanstack/react-router";
 import {
   ArrowLeft,
   MapPin,
@@ -16,19 +16,24 @@ import {
   Ruler,
   ChevronDown,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AppNavbar } from "@/components/layout/AppNavbar";
 import { fetchProjectBySlug, useProject } from "@/hooks/use-projects";
 import { formatAed, bedroomsLabel, positiveCount } from "@/lib/dubai";
 import { whatsappUrl, viewingMailto } from "@/lib/contact";
 import { mediaSrc } from "@/lib/media";
 import { track } from "@/lib/analytics";
+import { recordUsageEvent } from "@/features/usage/client";
 import { safeHttpUrl } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { ProjectWithRelations } from "@/lib/types";
-import { areaLabel, displayUnitTypes, highestUnitPrice, lowestUnitPrice, pricedUnitTypes, projectDetailSlug, unitDetailSlug } from "@/lib/unit-types";
+import { areaLabel, displayUnitTypes, highestUnitPrice, lowestUnitPrice, pricedUnitTypes, projectDetailSlug, unitAvailabilityLabel } from "@/lib/unit-types";
 import { displayPaymentPlans, paymentPlanSummary } from "@/lib/payment-plans";
 import { UnitOfferDialog } from "@/components/offers/UnitOfferDialog";
+import {
+  useFirstPublishedProjectTour,
+  usePublishedBuildingTours,
+} from "@/features/virtual-tour/queries";
 
 export const Route = createFileRoute("/projects/$slug")({
   // Fetch on the server so <head> SEO tags + structured data are built from real
@@ -80,17 +85,24 @@ export const Route = createFileRoute("/projects/$slug")({
     };
   },
   component: ProjectDetail,
-  errorComponent: ({ error }) => <div className="p-10 text-center text-muted-foreground">{error.message}</div>,
+  errorComponent: ({ error }) => <div className="p-10 text-center text-muted-foreground">{error instanceof Error ? error.message : "Project could not load."}</div>,
   notFoundComponent: () => <div className="p-10 text-center text-muted-foreground">Project not found.</div>,
 });
 
 function ProjectDetail() {
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
   const loaderData = Route.useLoaderData();
   const { slug } = Route.useParams();
-  const clientProject = useProject(slug);
+  const clientProject = useProject(slug, loaderData.project);
   const p = clientProject.data ?? loaderData.project;
+  const internalTour = useFirstPublishedProjectTour(p?.id);
+  const buildingTours = usePublishedBuildingTours(p?.id);
+  const trackedProjectId = useRef<string | null>(null);
   useEffect(() => {
-    if (p) track("view_project", { slug: p.slug, name: p.name, price: lowestUnitPrice(p.unit_types, p.starting_price_aed) });
+    if (!p || trackedProjectId.current === p.id) return;
+    trackedProjectId.current = p.id;
+    track("view_project", { slug: p.slug, name: p.name, price: lowestUnitPrice(p.unit_types, p.starting_price_aed) });
+    void recordUsageEvent("project_viewed", { project_id: p.id, slug: p.slug }, p.tenant_id);
   }, [p]);
   // Hero + gallery images for the click-to-swap viewer (hero first, deduped).
   const images = useMemo(() => {
@@ -124,6 +136,11 @@ function ProjectDetail() {
   useEffect(() => setActiveImage(images[0]?.full ?? null), [p?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   // Collapse the plan breakdown when switching projects.
   useEffect(() => setPlansOpen(false), [p?.id]);
+
+  // The unit route is nested under this project route. Render only the child
+  // page for /units/... so the project detail screen cannot mask the unit experience.
+  if (pathname.includes("/units/")) return <Outlet />;
+
   if (!p) {
     return (
       <div className="min-h-screen">
@@ -219,10 +236,10 @@ function ProjectDetail() {
                       <div key={item.id} className="flex items-center justify-between gap-4 rounded-xl bg-black/15 px-3 py-2">
                         {item.id === "legacy-starting-price" ? <span className="font-medium text-cream">{item.label}</span> : <Link
                           to="/projects/$slug/units/$unitTypeId"
-                          params={{ slug: projectDetailSlug({ name: p.name, slug: p.slug }), unitTypeId: unitDetailSlug({ projectName: p.name, projectSlug: p.slug, developerName: p.developer?.name, developerSlug: p.developer?.slug, unitLabel: item.label }) }}
+                          params={{ slug: projectDetailSlug({ name: p.name, slug: p.slug }), unitTypeId: item.id }}
                           className="font-medium text-cream underline-offset-4 hover:text-gold hover:underline"
                         >
-                          {item.label}
+                          {item.label} <span className="ml-2 text-xs text-muted-foreground">{unitAvailabilityLabel(item)}</span>
                         </Link>}
                         <span className="text-gold-gradient">{item.price_aed != null && item.price_aed > 0 ? formatAed(item.price_aed) : "Price on request"}</span>
                       </div>
@@ -344,17 +361,44 @@ function ProjectDetail() {
                   <FileDown className="mr-1 h-4 w-4" /> Sales offer PDF
                 </Button>
               )}
-              {safeHttpUrl(p.tour_360_url) && (
+              {internalTour.data ? (
+                <Button asChild variant="outline" className="glass gold-hairline text-cream">
+                  <Link
+                    to="/projects/$slug/tour/$tourId"
+                    params={{ slug: p.slug, tourId: internalTour.data.id }}
+                  >
+                    <PlayCircle className="mr-1 h-4 w-4" /> استكشف 360°
+                  </Link>
+                </Button>
+              ) : !internalTour.isLoading && safeHttpUrl(p.tour_360_url) ? (
                 <Button asChild variant="outline" className="glass gold-hairline text-cream">
                   <a href={safeHttpUrl(p.tour_360_url) ?? undefined} target="_blank" rel="noreferrer"><PlayCircle className="mr-1 h-4 w-4" /> 360° Tour</a>
                 </Button>
-              )}
+              ) : null}
               {safeHttpUrl(p.video_url) && (
                 <Button asChild variant="outline" className="glass gold-hairline text-cream">
                   <a href={safeHttpUrl(p.video_url) ?? undefined} target="_blank" rel="noreferrer"><PlayCircle className="mr-1 h-4 w-4" /> Video</a>
                 </Button>
               )}
             </div>
+
+            {(buildingTours.data?.length ?? 0) > 0 && (
+              <div className="glass gold-hairline rounded-2xl p-4">
+                <div className="text-xs uppercase tracking-widest text-gold">جولات الأبراج</div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {buildingTours.data?.map(({ building, tour }) => (
+                    <Button key={tour.id} asChild size="sm" variant="outline">
+                      <Link
+                        to="/projects/$slug/tour/$tourId"
+                        params={{ slug: p.slug, tourId: tour.id }}
+                      >
+                        <Building2 className="mr-1 h-4 w-4" /> {building.name}
+                      </Link>
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {p.description && (
               <div className="glass rounded-2xl p-4 text-sm leading-relaxed text-cream/90">{p.description}</div>

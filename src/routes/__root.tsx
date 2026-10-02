@@ -7,13 +7,16 @@ import {
   Scripts,
   Link,
 } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { Toaster } from "@/components/ui/sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useTenantStore } from "@/store/tenant";
 import { GA_ID } from "@/lib/analytics";
+import { clearProjectMediaCache } from "@/lib/media";
+import { clearTourAssetCache } from "@/features/virtual-tour/tourAssetUrl";
+import { clearPasswordRecovery, markPasswordRecovery } from "@/lib/password-recovery";
 
 // Origin of the Supabase project (from VITE_SUPABASE_URL) — preconnected so the
 // first auth/data request doesn't pay a cold DNS+TLS handshake.
@@ -57,7 +60,7 @@ function NotFoundComponent() {
   );
 }
 
-function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
+function ErrorComponent({ error, reset }: { error: unknown; reset: () => void }) {
   console.error(error);
   const router = useRouter();
 
@@ -154,9 +157,26 @@ function RootShell({ children }: { children: ReactNode }) {
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
   const router = useRouter();
+  const currentUserId = useRef<string | null>(null);
   useEffect(() => {
-    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
-      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT" && event !== "USER_UPDATED") return;
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY" && session?.user) markPasswordRecovery(session.user.id);
+      if (event === "SIGNED_OUT" || event === "USER_UPDATED") clearPasswordRecovery();
+      if (event === "INITIAL_SESSION") {
+        currentUserId.current = session?.user.id ?? null;
+        return;
+      }
+      if (event !== "SIGNED_IN" && event !== "SIGNED_OUT" && event !== "USER_UPDATED" && event !== "PASSWORD_RECOVERY") return;
+
+      // Supabase also emits SIGNED_IN when the same session is confirmed on
+      // tab focus. That is not an account change: clearing queries here tears
+      // down the visible map and makes returning to the tab look like a reload.
+      if (event === "SIGNED_IN" && currentUserId.current === session?.user.id) return;
+      currentUserId.current = session?.user.id ?? null;
+
+      clearProjectMediaCache();
+      clearTourAssetCache();
+      queryClient.clear();
 
       if (event === "SIGNED_OUT") {
         // Every cached row was fetched under the previous session's RLS scope —
@@ -165,10 +185,7 @@ function RootComponent() {
         // while it refetches, so the signed-out map kept showing it; clear()
         // drops it outright, and the remounted queries refetch as anon. The
         // tenant store is reset for the same reason.
-        queryClient.clear();
         useTenantStore.getState().reset();
-      } else {
-        queryClient.invalidateQueries();
       }
 
       router.invalidate();

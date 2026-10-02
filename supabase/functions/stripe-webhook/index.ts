@@ -23,8 +23,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") ?? "");
 const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "";
-const MONTHLY_PRICE_AED_FILS = 10000;
-const YEARLY_PRICE_AED_FILS = 100000;
+const MONTHLY_PRICE_AED_FILS = 3000;
+const YEARLY_PRICE_AED_FILS = 30000;
+const LEGACY_MONTHLY_PRICE_AED_FILS = 10000;
+const LEGACY_YEARLY_PRICE_AED_FILS = 100000;
 const CURRENCY = "aed";
 
 const admin = createClient(
@@ -85,14 +87,14 @@ function isApprovedSubscription(sub: Stripe.Subscription): boolean {
   const interval = price.recurring?.interval;
   if (interval !== "month" && interval !== "year") return false;
 
-  const expectedId = configuredPriceId(interval);
-  if (expectedId && price.id !== expectedId) return false;
+  if (item.quantity !== 1 || price.currency !== CURRENCY) return false;
+  if (price.unit_amount === expectedPrice(interval)) return true;
 
-  return (
-    item.quantity === 1 &&
-    price.currency === CURRENCY &&
-    price.unit_amount === expectedPrice(interval)
-  );
+  // Keep processing renewals and cancellations for subscriptions sold at the
+  // former price. Configured IDs, when present, still constrain legacy prices.
+  const legacyAmount = interval === "year" ? LEGACY_YEARLY_PRICE_AED_FILS : LEGACY_MONTHLY_PRICE_AED_FILS;
+  const expectedId = configuredPriceId(interval);
+  return price.unit_amount === legacyAmount && (!expectedId || price.id === expectedId);
 }
 
 // Fields written to `tenants` from a subscription, shared by every event branch.

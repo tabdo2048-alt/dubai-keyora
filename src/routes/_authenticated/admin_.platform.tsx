@@ -1,9 +1,13 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { Activity, ArrowLeft, Loader2, Users } from "lucide-react";
 import { AppNavbar } from "@/components/layout/AppNavbar";
 import { Button } from "@/components/ui/button";
 import { useAuth, useIsAdmin } from "@/hooks/use-auth";
-import { SubscribersManager, UsersManager, PoiManager, PublicProjectsManager } from "./admin";
+import { PublicProjectsManager } from "./admin";
+import { PoiManager } from "@/components/admin/PoiManager";
+import { SubscribersManager } from "@/components/admin/PlatformAccountManagers";
+import { MediaStorageManager } from "@/components/admin/MediaStorageManager";
+import { isPlatformOwner } from "@/lib/platform-owner";
 
 // `admin_` (trailing underscore) un-nests this to a standalone /admin/platform
 // page. Platform-admin (has_role 'admin') ONLY — separate from the per-org
@@ -15,6 +19,7 @@ export const Route = createFileRoute("/_authenticated/admin_/platform")({
 function PlatformPage() {
   const { user } = useAuth();
   const { data: isAdmin, isLoading } = useIsAdmin(user);
+  const canManage = Boolean(isAdmin && isPlatformOwner(user));
 
   return (
     <div className="min-h-screen">
@@ -27,7 +32,7 @@ function PlatformPage() {
           Platform <span className="text-gold-gradient">control</span>
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Manage every subscriber and the shared map data. Platform admins only.
+          Review subscribers and shared map data. Platform changes are restricted to the platform owner.
         </p>
 
         {isLoading ? (
@@ -38,10 +43,21 @@ function PlatformPage() {
           <div className="mt-8 text-muted-foreground">This account is not a platform administrator.</div>
         ) : (
           <>
-            <PublicProjectsManager />
-            <SubscribersManager />
-            <UsersManager />
-            <PoiManager />
+            {!canManage ? <div className="glass gold-hairline mt-6 rounded-2xl p-4 text-sm text-muted-foreground">Read-only access. Management actions are available only to the platform owner.</div> : null}
+            {canManage ? (
+              <div className="mt-6 flex flex-wrap gap-3">
+                <Button asChild variant="outline" className="glass gold-hairline text-cream">
+                  <Link to="/admin/activity-log"><Activity className="mr-2 h-4 w-4" /> Activity log</Link>
+                </Button>
+                <Button asChild variant="outline" className="glass gold-hairline text-cream">
+                  <Link to="/admin/platform/users"><Users className="mr-2 h-4 w-4" /> Manage Users</Link>
+                </Button>
+              </div>
+            ) : null}
+            <PublicProjectsManager canManage={canManage} />
+            <SubscribersManager canManage={canManage} />
+            <MediaStorageManager canManage={canManage} />
+            <PoiManager canManage={canManage} />
           </>
         )}
       </div>

@@ -62,10 +62,13 @@ Create a `.env` file in the project root:
 | `SUPABASE_SERVICE_ROLE_KEY` | server | Service-role key (admin operations only — never expose to the client) |
 | `STRIPE_SECRET_KEY` | server | Stripe secret key (server/Edge Functions only) |
 | `STRIPE_WEBHOOK_SECRET` | server/Edge Function | Stripe webhook signing secret |
-| `STRIPE_MONTHLY_PRICE_ID` | server/Edge Function | Optional verified Stripe Price ID for 100 AED/month |
-| `STRIPE_YEARLY_PRICE_ID` | server/Edge Function | Optional verified Stripe Price ID for 1,000 AED/year |
-| `APP_URL` | server | Canonical HTTPS application URL for Stripe redirects |
+| `STRIPE_MONTHLY_PRICE_ID` | server/Edge Function | Optional verified Stripe Price ID for 30 AED/month; legacy 100 AED ID falls back to inline pricing for new checkouts |
+| `STRIPE_YEARLY_PRICE_ID` | server/Edge Function | Optional verified Stripe Price ID for 300 AED/year; legacy 1,000 AED ID falls back to inline pricing for new checkouts |
+| `APP_URL` | server | Canonical HTTPS application URL for Stripe and password recovery redirects |
 | `GOOGLE_MAPS_API_KEY` | server | Optional, for Google geodata lookups |
+| `CLOUDINARY_CLOUD_NAME` | server | Cloudinary product-environment cloud name for project videos |
+| `CLOUDINARY_API_KEY` | server | Cloudinary API key used in signed video uploads |
+| `CLOUDINARY_API_SECRET` | server | Cloudinary API secret used only by the server-side signer — never expose to the client |
 | `VITE_WATER_DEBUG` | client | Optional: `true` enables the water debug editor |
 | `VITE_NAVIGATION_DEBUG_OVERLAY` | client | Optional: `true` shows the marine-navigation debug overlay |
 
@@ -77,6 +80,16 @@ Migrations and seed data live in `supabase/`:
 supabase db push                                  # apply migrations
 psql < supabase/seed_dubai_sample_projects.sql    # optional sample data
 ```
+
+### Password recovery
+
+Platform → Manage Users lets the platform owner request a reset email for an existing account. The sign-in form also offers self-service recovery. Neither flow exposes or sets another user's password.
+
+In Supabase Authentication → URL Configuration, set the production Site URL and add the exact redirect URL `https://keyora-dubai.vercel.app/reset-password` (or `<APP_URL>/reset-password` for a different canonical domain). For local testing, add the actual dev origin plus `/reset-password`. Verify that the recovery email template uses Supabase's confirmation URL and that the project's SMTP provider can deliver emails. Test the complete link → new password → fresh sign-in flow with a disposable account before enabling it for customers.
+
+### Project teaser videos
+
+Project managers can upload MP4 or WebM videos (up to 100 MB) from the project form. The browser uploads directly to Cloudinary using a short-lived server-generated signature; Supabase stores only the returned URL in `projects.video_url`. Configure the three server-only Cloudinary variables above in Vercel for Production, Preview, and Development. Map popups play at most the first 10 seconds, regardless of the uploaded video's full duration.
 
 ## Scripts
 

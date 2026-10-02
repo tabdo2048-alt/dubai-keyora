@@ -1,11 +1,16 @@
-import { Document, Image, Page, Text, View } from "@react-pdf/renderer";
+import { Circle, Document, Image, Page, Path, Svg, Text, View } from "@react-pdf/renderer";
 import type { ProjectWithRelations } from "@/lib/types";
 import type { DisplayPaymentPlan } from "@/lib/payment-plans";
 import type { DisplayUnitType } from "@/lib/unit-types";
 import { formatCurrency, formatPercentage, type OfferCalculation } from "@/lib/offer-calculations";
-import { bedroomsLabel, positiveCount } from "@/lib/dubai";
-import { areaLabel } from "@/lib/unit-types";
-import { projectMainImage, projectOfferImage, unitFloorPlanImage, unitPhotoImage } from "@/lib/pdf-media";
+
+import { areaLabel, unitAvailabilityLabel } from "@/lib/unit-types";
+import {
+  projectMainImage,
+  projectOfferImage,
+  unitFloorPlanImage,
+  unitPhotoImage,
+} from "@/lib/pdf-media";
 import { safeOfferColor } from "@/lib/offer-branding";
 import { safeHttpUrl } from "@/lib/utils";
 import { chartColors, offerColors, offerStyles } from "@/pdf/offer-pdf-styles";
@@ -19,8 +24,6 @@ export type UnitSalesOfferPdfProps = {
   offerDate: string;
   validUntil: string;
   qrCodeDataUrl?: string;
-  whatsappNumber?: string;
-  shareUrl: string;
   projectImageSrc?: string;
   projectMainImageSrc?: string;
   unitPhotoImageSrc?: string;
@@ -28,7 +31,7 @@ export type UnitSalesOfferPdfProps = {
   developerLogoSrc?: string;
 };
 
-function LegacyUnitSalesOfferPdf({
+function MultiPageSalesOffer({
   project,
   unit,
   plan,
@@ -37,45 +40,80 @@ function LegacyUnitSalesOfferPdf({
   offerDate,
   validUntil,
   qrCodeDataUrl,
-  whatsappNumber,
-  shareUrl,
   projectImageSrc,
   projectMainImageSrc,
+  unitPhotoImageSrc,
   unitPlanImageSrc,
   developerLogoSrc,
 }: UnitSalesOfferPdfProps) {
   const projectHeroImage = projectImageSrc || projectOfferImage(project);
-  const projectDetailImage = projectMainImageSrc || projectMainImage(project);
+  const projectDetailImage = unitPhotoImageSrc || unitPhotoImage(unit) || projectMainImageSrc || projectMainImage(project);
   const unitPlanImage = unitPlanImageSrc || unitFloorPlanImage(unit);
   const heroImage = projectHeroImage;
   const developerLogo = developerLogoSrc || safeHttpUrl(project.developer?.logo_url);
   const primaryColor = safeOfferColor(project.offer_primary_color, offerColors.navy);
   const accentColor = safeOfferColor(project.offer_accent_color, offerColors.gold);
   const unitArea = areaLabel(unit);
-  const summaryCount = calculation.installments.length + 1;
-  const summaryCardWidth = summaryCount <= 3 ? "32.2%" : summaryCount === 4 ? "24.2%" : summaryCount === 5 ? "19.3%" : summaryCount === 6 ? "15.9%" : "13.55%";
+  const summaryCount = Math.min(calculation.installments.length, 4) + 1;
+  const summaryCardWidth =
+    summaryCount <= 3
+      ? "32.2%"
+      : summaryCount === 4
+        ? "24.2%"
+        : summaryCount === 5
+          ? "19.3%"
+          : summaryCount === 6
+            ? "15.9%"
+            : "13.55%";
   const detailRows = [
     ["Project", project.name],
     ["Unit type", unit.label],
     ["Floor", unit.floor],
     ["Size", unitArea],
-    ["Bedrooms", bedroomsLabel(project)],
-    ["Bathrooms", positiveCount(project.bathrooms)?.toString() ?? null],
+    ["Bedrooms", unit.bedrooms == null ? null : unit.bedrooms === 0 ? "Studio" : String(unit.bedrooms)],
+    ["Bathrooms", unit.bathrooms?.toString() ?? null],
     ["Developer", project.developer?.name],
-    ["Status", project.status],
+    ["Availability", unitAvailabilityLabel(unit)],
+    ["View", unit.view_description],
     ["Completion", project.completion_date],
   ].filter((row): row is [string, string] => Boolean(row[1]));
 
   return (
-    <Document title={`${project.name} - Sales Offer`} author={project.developer?.name ?? project.name}>
+    <Document
+      title={`${project.name} - Sales Offer`}
+      author={project.developer?.name ?? project.name}
+    >
       <Page size="A4" orientation="landscape" style={offerStyles.page} wrap={false}>
-        <OfferHeader project={project} heroImage={heroImage} developerLogo={developerLogo} offerId={offerId} offerDate={offerDate} validUntil={validUntil} />
+        <OfferHeader
+          project={project}
+          heroImage={heroImage}
+          developerLogo={developerLogo}
+          offerId={offerId}
+          offerDate={offerDate}
+          validUntil={validUntil}
+          floor={unit.floor}
+        />
 
         <View style={offerStyles.body}>
           <View style={offerStyles.cardRow}>
-              <SummaryCard width={summaryCardWidth} label="Selected unit price" primary={formatCurrency(calculation.unitPrice)} secondary={unit.label} primaryColor={primaryColor} accentColor={accentColor} />
-            {calculation.installments.map((installment) => (
-              <SummaryCard width={summaryCardWidth} key={installment.id} label={installment.label} primary={formatPercentage(installment.percentage)} secondary={formatCurrency(installment.amount)} primaryColor={primaryColor} accentColor={accentColor} />
+            <SummaryCard
+              width={summaryCardWidth}
+              label="Selected unit price"
+              primary={formatCurrency(calculation.unitPrice)}
+              secondary={unit.label}
+              primaryColor={primaryColor}
+              accentColor={accentColor}
+            />
+            {calculation.installments.slice(0, 4).map((installment) => (
+              <SummaryCard
+                width={summaryCardWidth}
+                key={installment.id}
+                label={installment.label}
+                primary={formatPercentage(installment.percentage)}
+                secondary={formatCurrency(installment.amount)}
+                primaryColor={primaryColor}
+                accentColor={accentColor}
+              />
             ))}
           </View>
 
@@ -84,12 +122,44 @@ function LegacyUnitSalesOfferPdf({
               <Text style={offerStyles.sectionTitle}>Unit details</Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={offerStyles.detailCard}>
-                {projectDetailImage && <Image src={projectDetailImage} style={offerStyles.projectDetailImage} />}
-                {projectDetailImage && <Text style={offerStyles.imageCaption}>Project image</Text>}
+                {projectDetailImage && (
+                  <Image src={projectDetailImage} style={offerStyles.projectDetailImage} />
+                )}
+                {projectDetailImage && <Text style={offerStyles.imageCaption}>{unitPhotoImageSrc || unitPhotoImage(unit) ? "Unit photo" : "Project image"}</Text>}
                 {detailRows.map(([label, value]) => (
-                  <View style={label === "Floor" ? [offerStyles.detailRow, { backgroundColor: primaryColor, borderRadius: 3, paddingHorizontal: 4 }] : offerStyles.detailRow} key={label}>
-                    <Text style={label === "Floor" ? [offerStyles.detailLabel, { color: offerColors.gold }] : offerStyles.detailLabel}>{label}</Text>
-                    <Text style={label === "Floor" ? [offerStyles.detailValue, { color: "#ffffff" }] : offerStyles.detailValue}>{value}</Text>
+                  <View
+                    style={
+                      label === "Floor"
+                        ? [
+                            offerStyles.detailRow,
+                            {
+                              backgroundColor: primaryColor,
+                              borderRadius: 3,
+                              paddingHorizontal: 4,
+                            },
+                          ]
+                        : offerStyles.detailRow
+                    }
+                    key={label}
+                  >
+                    <Text
+                      style={
+                        label === "Floor"
+                          ? [offerStyles.detailLabel, { color: offerColors.gold }]
+                          : offerStyles.detailLabel
+                      }
+                    >
+                      {label}
+                    </Text>
+                    <Text
+                      style={
+                        label === "Floor"
+                          ? [offerStyles.detailValue, { color: "#ffffff" }]
+                          : offerStyles.detailValue
+                      }
+                    >
+                      {value}
+                    </Text>
                   </View>
                 ))}
               </View>
@@ -98,13 +168,22 @@ function LegacyUnitSalesOfferPdf({
             <View style={offerStyles.rightColumn}>
               <Text style={offerStyles.sectionTitle}>Project overview</Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
-              <Text style={offerStyles.overview}>{project.description ?? "Project information is available from the selected listing."}</Text>
+              <Text style={offerStyles.overview}>
+                {project.description ??
+                  "Project information is available from the selected listing."}
+              </Text>
               <View style={[offerStyles.planHighlight, { backgroundColor: primaryColor }]}>
-                <Text style={[offerStyles.planHighlightLabel, { color: accentColor }]}>Selected payment plan</Text>
+                <Text style={[offerStyles.planHighlightLabel, { color: accentColor }]}>
+                  Selected payment plan
+                </Text>
                 <Text style={offerStyles.planHighlightName}>{plan.label}</Text>
                 <View style={offerStyles.planHighlightRow}>
-                  <Text style={offerStyles.planHighlightMeta}>{calculation.installments.length} configured installments</Text>
-                  <Text style={[offerStyles.planHighlightTotal, { color: accentColor }]}>{formatPercentage(calculation.totalPercentage)}</Text>
+                  <Text style={offerStyles.planHighlightMeta}>
+                    {calculation.installments.length} configured installments
+                  </Text>
+                  <Text style={[offerStyles.planHighlightTotal, { color: accentColor }]}>
+                    {formatPercentage(calculation.totalPercentage)}
+                  </Text>
                 </View>
               </View>
             </View>
@@ -127,7 +206,9 @@ function LegacyUnitSalesOfferPdf({
         <View style={offerStyles.body}>
           <Text style={[offerStyles.eyebrow, { color: accentColor }]}>Payment structure</Text>
           <Text style={[offerStyles.pageHeading, { color: primaryColor }]}>{plan.label}</Text>
-          <Text style={offerStyles.pageIntro}>Every row below is an installment saved on the selected payment plan.</Text>
+          <Text style={offerStyles.pageIntro}>
+            Every row below is an installment saved on the selected payment plan.
+          </Text>
 
           <Text style={offerStyles.sectionTitle}>Payment plan summary</Text>
           <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
@@ -138,16 +219,24 @@ function LegacyUnitSalesOfferPdf({
               <Text style={offerStyles.sectionTitle}>Payment distribution</Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={offerStyles.distributionBox}>
-                <View style={offerStyles.distributionBar}>
-                  {calculation.installments.map((installment, index) => (
-                    <View key={installment.id} style={[offerStyles.distributionSegment, { width: `${Math.max(0, installment.percentage)}%`, backgroundColor: chartColors[index % chartColors.length] }]} />
-                  ))}
-                </View>
+                <PaymentDonutChart
+                  calculation={calculation}
+                  primaryColor={primaryColor}
+                  accentColor={accentColor}
+                />
                 <View style={offerStyles.legend}>
                   {calculation.installments.map((installment, index) => (
                     <View style={offerStyles.legendItem} key={installment.id}>
-                      <View style={[offerStyles.legendDot, { backgroundColor: chartColors[index % chartColors.length] }]} />
-                      <Text style={offerStyles.legendText}>{installment.label} - {formatPercentage(installment.percentage)} - {formatCurrency(installment.amount)}</Text>
+                      <View
+                        style={[
+                          offerStyles.legendDot,
+                          { backgroundColor: chartColors[index % chartColors.length] },
+                        ]}
+                      />
+                      <Text style={offerStyles.legendText}>
+                        {installment.label} - {formatPercentage(installment.percentage)} -{" "}
+                        {formatCurrency(installment.amount)}
+                      </Text>
                     </View>
                   ))}
                 </View>
@@ -159,10 +248,23 @@ function LegacyUnitSalesOfferPdf({
               <View style={[offerStyles.timeline, { borderLeftColor: accentColor }]}>
                 {calculation.installments.map((installment) => (
                   <View style={offerStyles.timelineItem} key={installment.id}>
-                    <View style={[offerStyles.timelineDot, { backgroundColor: primaryColor, borderColor: accentColor }]} />
-                    {installment.due_label && <Text style={[offerStyles.timelineDue, { color: accentColor }]}>{installment.due_label}</Text>}
-                    <Text style={offerStyles.timelineLabel}>{installment.label} - {formatPercentage(installment.percentage)}</Text>
-                    <Text style={offerStyles.timelineAmount}>{formatCurrency(installment.amount)}</Text>
+                    <View
+                      style={[
+                        offerStyles.timelineDot,
+                        { backgroundColor: primaryColor, borderColor: accentColor },
+                      ]}
+                    />
+                    {installment.due_label && (
+                      <Text style={[offerStyles.timelineDue, { color: accentColor }]}>
+                        {installment.due_label}
+                      </Text>
+                    )}
+                    <Text style={offerStyles.timelineLabel}>
+                      {installment.label} - {formatPercentage(installment.percentage)}
+                    </Text>
+                    <Text style={offerStyles.timelineAmount}>
+                      {formatCurrency(installment.amount)}
+                    </Text>
                   </View>
                 ))}
               </View>
@@ -174,13 +276,24 @@ function LegacyUnitSalesOfferPdf({
               <Text style={offerStyles.sectionTitle}>Financial summary</Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={[offerStyles.financialBox, { backgroundColor: primaryColor }]}>
-                <FinancialRow label="Unit price" value={formatCurrency(calculation.financialSummary.unitPrice)} />
+                <FinancialRow
+                  label="Unit price"
+                  value={formatCurrency(calculation.financialSummary.unitPrice)}
+                />
                 {calculation.financialSummary.feeRows.map((fee) => (
-                  <FinancialRow key={fee.id} label={`${fee.label} (${fee.fee_type === "percentage" ? formatPercentage(Number(fee.value)) : "fixed"})`} value={formatCurrency(fee.amount)} />
+                  <FinancialRow
+                    key={fee.id}
+                    label={`${fee.label} (${fee.fee_type === "percentage" ? formatPercentage(Number(fee.value)) : "fixed"})`}
+                    value={formatCurrency(fee.amount)}
+                  />
                 ))}
                 <View style={offerStyles.financialTotal}>
-                  <Text style={[offerStyles.financialTotalLabel, { color: accentColor }]}>Total investment</Text>
-                  <Text style={offerStyles.financialTotalValue}>{formatCurrency(calculation.financialSummary.totalInvestment)}</Text>
+                  <Text style={[offerStyles.financialTotalLabel, { color: accentColor }]}>
+                    Total investment
+                  </Text>
+                  <Text style={offerStyles.financialTotalValue}>
+                    {formatCurrency(calculation.financialSummary.totalInvestment)}
+                  </Text>
                 </View>
               </View>
             </View>
@@ -192,8 +305,12 @@ function LegacyUnitSalesOfferPdf({
                 <View style={offerStyles.detailCard}>
                   {calculation.monthlyInstallments.map((installment) => (
                     <View style={offerStyles.detailRow} key={installment.id}>
-                      <Text style={offerStyles.detailLabel}>{installment.label} - {installment.months} months</Text>
-                      <Text style={offerStyles.detailValue}>{formatCurrency(installment.monthlyAmount)} / month</Text>
+                      <Text style={offerStyles.detailLabel}>
+                        {installment.label} - {installment.months} months
+                      </Text>
+                      <Text style={offerStyles.detailValue}>
+                        {formatCurrency(installment.monthlyAmount)} / month
+                      </Text>
                     </View>
                   ))}
                 </View>
@@ -201,16 +318,15 @@ function LegacyUnitSalesOfferPdf({
             )}
           </View>
 
-          {(project.developer?.name || project.developer?.website || qrCodeDataUrl) && (
-            <View style={[offerStyles.contactBox, { backgroundColor: primaryColor }]}>
-              <View style={offerStyles.contactCopy}>
-                <Text style={[offerStyles.contactTitle, { color: accentColor }]}>Prepared by</Text>
-                {project.developer?.name && <Text style={offerStyles.contactName}>{project.developer.name}</Text>}
-                {project.developer?.website && <Text style={offerStyles.contactLine}>{project.developer.website}</Text>}
-                {whatsappNumber && <Text style={offerStyles.contactLine}>WhatsApp: +{whatsappNumber}</Text>}
-                <Text style={offerStyles.contactLine}>Project page: {shareUrl}</Text>
-              </View>
-              {qrCodeDataUrl && <Image src={qrCodeDataUrl} style={offerStyles.qr} />}
+          {qrCodeDataUrl && (
+            <View
+              style={[
+                offerStyles.contactBox,
+                offerStyles.qrOnlyBox,
+                { backgroundColor: primaryColor },
+              ]}
+            >
+              <Image src={qrCodeDataUrl} style={offerStyles.qr} />
             </View>
           )}
         </View>
@@ -221,7 +337,14 @@ function LegacyUnitSalesOfferPdf({
 }
 
 export function UnitSalesOfferPdf(props: UnitSalesOfferPdfProps) {
-  return <OnePageSalesOffer {...props} />;
+  // Keep compact plans as a single high-impact sheet. Plans with more rows get
+  // a dedicated payment page so labels, dates and amounts never shrink into
+  // unreadable text or collide with the media/contact section.
+  return props.calculation.installments.length <= 4 ? (
+    <OnePageSalesOffer {...props} />
+  ) : (
+    <MultiPageSalesOffer {...props} />
+  );
 }
 
 function OnePageSalesOffer({
@@ -233,8 +356,6 @@ function OnePageSalesOffer({
   offerDate,
   validUntil,
   qrCodeDataUrl,
-  whatsappNumber,
-  shareUrl,
   projectImageSrc,
   unitPhotoImageSrc,
   unitPlanImageSrc,
@@ -247,30 +368,57 @@ function OnePageSalesOffer({
   const primaryColor = safeOfferColor(project.offer_primary_color, offerColors.navy);
   const accentColor = safeOfferColor(project.offer_accent_color, offerColors.gold);
   const unitArea = areaLabel(unit);
-  const summaryCount = calculation.installments.length + 1;
+  const summaryCount = Math.min(calculation.installments.length, 4) + 1;
   const summaryCardWidth = `${Math.max(5.2, (100 - (summaryCount - 1) * 0.7) / summaryCount)}%`;
   const detailRows = [
     ["Project", project.name],
     ["Unit type", unit.label],
     ["Floor", unit.floor],
     ["Size", unitArea],
-    ["Bedrooms", bedroomsLabel(project)],
-    ["Bathrooms", positiveCount(project.bathrooms)?.toString() ?? null],
+    ["Bedrooms", unit.bedrooms == null ? null : unit.bedrooms === 0 ? "Studio" : String(unit.bedrooms)],
+    ["Bathrooms", unit.bathrooms?.toString() ?? null],
     ["Developer", project.developer?.name],
-    ["Status", project.status],
+    ["Availability", unitAvailabilityLabel(unit)],
+    ["View", unit.view_description],
     ["Completion", project.completion_date],
   ].filter((row): row is [string, string] => Boolean(row[1]));
 
   return (
-    <Document title={`${project.name} - Sales Offer`} author={project.developer?.name ?? project.name}>
+    <Document
+      title={`${project.name} - Sales Offer`}
+      author={project.developer?.name ?? project.name}
+    >
       <Page size="A4" orientation="landscape" style={offerStyles.page} wrap={false}>
-        <OfferHeader project={project} heroImage={headerImage} developerLogo={developerLogo} offerId={offerId} offerDate={offerDate} validUntil={validUntil} />
+        <OfferHeader
+          project={project}
+          heroImage={headerImage}
+          developerLogo={developerLogo}
+          offerId={offerId}
+          offerDate={offerDate}
+          validUntil={validUntil}
+          floor={unit.floor}
+        />
 
         <View style={offerStyles.oneBody}>
           <View style={offerStyles.cardRow}>
-            <CompactSummaryCard width={summaryCardWidth} label="Unit price" primary={formatCurrency(calculation.unitPrice)} secondary={unit.label} primaryColor={primaryColor} accentColor={accentColor} />
+            <CompactSummaryCard
+              width={summaryCardWidth}
+              label="Unit price"
+              primary={formatCurrency(calculation.unitPrice)}
+              secondary={unit.label}
+              primaryColor={primaryColor}
+              accentColor={accentColor}
+            />
             {calculation.installments.map((installment) => (
-              <CompactSummaryCard key={installment.id} width={summaryCardWidth} label={installment.label} primary={formatPercentage(installment.percentage)} secondary={formatCurrency(installment.amount)} primaryColor={primaryColor} accentColor={accentColor} />
+              <CompactSummaryCard
+                key={installment.id}
+                width={summaryCardWidth}
+                label={installment.label}
+                primary={formatPercentage(installment.percentage)}
+                secondary={formatCurrency(installment.amount)}
+                primaryColor={primaryColor}
+                accentColor={accentColor}
+              />
             ))}
           </View>
 
@@ -280,34 +428,80 @@ function OnePageSalesOffer({
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={offerStyles.oneDetailCard}>
                 {detailRows.map(([label, value]) => (
-                  <View style={label === "Floor" ? [offerStyles.oneDetailRow, { backgroundColor: primaryColor, borderRadius: 3, paddingHorizontal: 4 }] : offerStyles.oneDetailRow} key={label}>
-                    <Text style={label === "Floor" ? [offerStyles.oneDetailLabel, { color: offerColors.gold }] : offerStyles.oneDetailLabel}>{label}</Text>
-                    <Text style={label === "Floor" ? [offerStyles.oneDetailValue, { color: "#ffffff" }] : offerStyles.oneDetailValue}>{value}</Text>
+                  <View
+                    style={
+                      label === "Floor"
+                        ? [
+                            offerStyles.oneDetailRow,
+                            {
+                              backgroundColor: primaryColor,
+                              borderRadius: 3,
+                              paddingHorizontal: 4,
+                            },
+                          ]
+                        : offerStyles.oneDetailRow
+                    }
+                    key={label}
+                  >
+                    <Text
+                      style={
+                        label === "Floor"
+                          ? [offerStyles.oneDetailLabel, { color: offerColors.gold }]
+                          : offerStyles.oneDetailLabel
+                      }
+                    >
+                      {label}
+                    </Text>
+                    <Text
+                      style={
+                        label === "Floor"
+                          ? [offerStyles.oneDetailValue, { color: "#ffffff" }]
+                          : offerStyles.oneDetailValue
+                      }
+                    >
+                      {value}
+                    </Text>
                   </View>
                 ))}
               </View>
-              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>Project overview</Text>
+              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>
+                Project overview
+              </Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
-              <Text style={offerStyles.oneOverview}>{project.description?.slice(0, 310) || "Project information is available from the selected listing."}</Text>
+              <Text style={offerStyles.oneOverview}>
+                {project.description?.slice(0, 310) ||
+                  "Project information is available from the selected listing."}
+              </Text>
             </View>
 
             <View style={offerStyles.oneCenterColumn}>
               <Text style={offerStyles.sectionTitle}>{plan.label}</Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <OnePagePaymentTable calculation={calculation} primaryColor={primaryColor} />
-              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>Payment distribution</Text>
+              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>
+                Payment distribution
+              </Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={offerStyles.oneDistributionBox}>
-                <View style={[offerStyles.oneDistributionBar, { flexDirection: "row", borderRadius: 4, overflow: "hidden" }]}>
-                  {calculation.installments.map((installment, index) => (
-                    <View key={installment.id} style={[offerStyles.oneDistributionSegment, { width: `${Math.max(0, installment.percentage)}%`, backgroundColor: chartColors[index % chartColors.length] }]} />
-                  ))}
-                </View>
+                <PaymentDonutChart
+                  calculation={calculation}
+                  primaryColor={primaryColor}
+                  accentColor={accentColor}
+                  compact
+                />
                 <View style={offerStyles.oneLegend}>
                   {calculation.installments.map((installment, index) => (
                     <View style={offerStyles.oneLegendItem} key={installment.id}>
-                      <View style={[offerStyles.oneLegendDot, { backgroundColor: chartColors[index % chartColors.length] }]} />
-                      <Text style={offerStyles.oneLegendText}>{installment.label} · {formatPercentage(installment.percentage)} · {formatCurrency(installment.amount)}</Text>
+                      <View
+                        style={[
+                          offerStyles.oneLegendDot,
+                          { backgroundColor: chartColors[index % chartColors.length] },
+                        ]}
+                      />
+                      <Text style={offerStyles.oneLegendText}>
+                        {installment.label} · {formatPercentage(installment.percentage)} ·{" "}
+                        {formatCurrency(installment.amount)}
+                      </Text>
                     </View>
                   ))}
                 </View>
@@ -320,33 +514,65 @@ function OnePageSalesOffer({
               <View style={[offerStyles.oneTimeline, { borderLeftColor: accentColor }]}>
                 {calculation.installments.map((installment) => (
                   <View style={offerStyles.oneTimelineItem} key={installment.id}>
-                    <View style={[offerStyles.oneTimelineDot, { backgroundColor: primaryColor, borderColor: accentColor }]} />
-                    {installment.due_label && <Text style={[offerStyles.oneTimelineDue, { color: accentColor }]}>{installment.due_label}</Text>}
-                    <Text style={offerStyles.oneTimelineLabel}>{installment.label} · {formatPercentage(installment.percentage)}</Text>
-                    <Text style={offerStyles.oneTimelineAmount}>{formatCurrency(installment.amount)}</Text>
+                    <View
+                      style={[
+                        offerStyles.oneTimelineDot,
+                        { backgroundColor: primaryColor, borderColor: accentColor },
+                      ]}
+                    />
+                    {installment.due_label && (
+                      <Text style={[offerStyles.oneTimelineDue, { color: accentColor }]}>
+                        {installment.due_label}
+                      </Text>
+                    )}
+                    <Text style={offerStyles.oneTimelineLabel}>
+                      {installment.label} · {formatPercentage(installment.percentage)}
+                    </Text>
+                    <Text style={offerStyles.oneTimelineAmount}>
+                      {formatCurrency(installment.amount)}
+                    </Text>
                   </View>
                 ))}
               </View>
-              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>Financial summary</Text>
+              <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>
+                Financial summary
+              </Text>
               <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
               <View style={[offerStyles.oneFinancialBox, { backgroundColor: primaryColor }]}>
-                <OnePageFinancialRow label="Unit price" value={formatCurrency(calculation.financialSummary.unitPrice)} />
+                <OnePageFinancialRow
+                  label="Unit price"
+                  value={formatCurrency(calculation.financialSummary.unitPrice)}
+                />
                 {calculation.financialSummary.feeRows.map((fee) => (
-                  <OnePageFinancialRow key={fee.id} label={`${fee.label} (${fee.fee_type === "percentage" ? formatPercentage(Number(fee.value)) : "fixed"})`} value={formatCurrency(fee.amount)} />
+                  <OnePageFinancialRow
+                    key={fee.id}
+                    label={`${fee.label} (${fee.fee_type === "percentage" ? formatPercentage(Number(fee.value)) : "fixed"})`}
+                    value={formatCurrency(fee.amount)}
+                  />
                 ))}
                 <View style={[offerStyles.financialTotal, offerStyles.oneFinancialTotal]}>
-                  <Text style={[offerStyles.oneFinancialTotalLabel, { color: accentColor }]}>Total investment</Text>
-                  <Text style={offerStyles.oneFinancialTotalValue}>{formatCurrency(calculation.financialSummary.totalInvestment)}</Text>
+                  <Text style={[offerStyles.oneFinancialTotalLabel, { color: accentColor }]}>
+                    Total investment
+                  </Text>
+                  <Text style={offerStyles.oneFinancialTotalValue}>
+                    {formatCurrency(calculation.financialSummary.totalInvestment)}
+                  </Text>
                 </View>
               </View>
               {calculation.monthlyInstallments.length > 0 && (
                 <>
-                  <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>Monthly amounts</Text>
+                  <Text style={[offerStyles.sectionTitle, offerStyles.oneOverviewTitle]}>
+                    Monthly amounts
+                  </Text>
                   <View style={[offerStyles.sectionRule, { borderBottomColor: accentColor }]} />
                   {calculation.monthlyInstallments.slice(0, 4).map((installment) => (
                     <View style={offerStyles.oneFinancialRow} key={installment.id}>
-                      <Text style={offerStyles.oneFinancialLabel}>{installment.label} · {installment.months} months</Text>
-                      <Text style={[offerStyles.oneFinancialValue, { color: offerColors.ink }]}>{formatCurrency(installment.monthlyAmount)} / month</Text>
+                      <Text style={offerStyles.oneFinancialLabel}>
+                        {installment.label} · {installment.months} months
+                      </Text>
+                      <Text style={[offerStyles.oneFinancialValue, { color: offerColors.ink }]}>
+                        {formatCurrency(installment.monthlyAmount)} / month
+                      </Text>
                     </View>
                   ))}
                 </>
@@ -356,7 +582,9 @@ function OnePageSalesOffer({
 
           <View style={offerStyles.oneBottomRow}>
             {unitPhoto && (
-              <View style={[offerStyles.oneFloorPlanBlock, { width: unitPlanImage ? "31%" : "62%" }]}>
+              <View
+                style={[offerStyles.oneFloorPlanBlock, { width: unitPlanImage ? "31%" : "62%" }]}
+              >
                 <View style={offerStyles.oneUnitPlanHeading}>
                   <Text style={offerStyles.sectionTitle}>Unit photo</Text>
                   <Text style={offerStyles.oneUnitPlanMeta}>{unit.label}</Text>
@@ -373,16 +601,19 @@ function OnePageSalesOffer({
                 <Image src={unitPlanImage} style={offerStyles.oneUnitPlanImage} />
               </View>
             )}
-            {(project.developer?.name || project.developer?.website || qrCodeDataUrl) && (
-              <View style={[offerStyles.contactBox, offerStyles.oneContactBlock, { backgroundColor: primaryColor, width: unitPhoto || unitPlanImage ? "38%" : "100%" }]}>
-                <View style={offerStyles.contactCopy}>
-                  <Text style={[offerStyles.contactTitle, { color: accentColor }]}>Prepared by</Text>
-                  {project.developer?.name && <Text style={offerStyles.contactName}>{project.developer.name}</Text>}
-                  {project.developer?.website && <Text style={offerStyles.contactLine}>{project.developer.website}</Text>}
-                  {whatsappNumber && <Text style={offerStyles.contactLine}>WhatsApp: +{whatsappNumber}</Text>}
-                  <Text style={offerStyles.contactLine}>Project page: {shareUrl}</Text>
-                </View>
-                {qrCodeDataUrl && <Image src={qrCodeDataUrl} style={offerStyles.qr} />}
+            {qrCodeDataUrl && (
+              <View
+                style={[
+                  offerStyles.contactBox,
+                  offerStyles.oneContactBlock,
+                  offerStyles.qrOnlyBox,
+                  {
+                    backgroundColor: primaryColor,
+                    width: unitPhoto || unitPlanImage ? "38%" : "100%",
+                  },
+                ]}
+              >
+                <Image src={qrCodeDataUrl} style={offerStyles.qr} />
               </View>
             )}
           </View>
@@ -393,37 +624,201 @@ function OnePageSalesOffer({
   );
 }
 
-function CompactSummaryCard({ width, label, primary, secondary, primaryColor, accentColor }: { width: string; label: string; primary: string; secondary: string; primaryColor: string; accentColor: string }) {
+
+function PaymentDonutChart({
+  calculation,
+  primaryColor,
+  accentColor,
+  compact = false,
+}: {
+  calculation: OfferCalculation;
+  primaryColor: string;
+  accentColor: string;
+  compact?: boolean;
+}) {
+  const size = compact ? 48 : 76;
+  const radius = compact ? 17 : 27;
+  const strokeWidth = compact ? 8 : 12;
+  let cumulativePercentage = 0;
+  const point = (r: number, angle: number) => {
+    const radians = ((angle - 90) * Math.PI) / 180;
+    return { x: size / 2 + r * Math.cos(radians), y: size / 2 + r * Math.sin(radians) };
+  };
+
   return (
-    <View style={[offerStyles.summaryCard, { width, minHeight: 39, padding: 5, backgroundColor: primaryColor }]}>
+    <View
+      style={{
+        alignSelf: "center",
+        alignItems: "center",
+        justifyContent: "center",
+        marginBottom: compact ? 3 : 7,
+      }}
+    >
+      <Svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          fill="none"
+          stroke="#e7e1d5"
+          strokeWidth={strokeWidth}
+        />
+        {calculation.installments.map((installment, index) => {
+          const percentage = Math.max(0, Math.min(100, installment.percentage));
+          if (percentage >= 99.9999) return <Circle key={installment.id} cx={size / 2} cy={size / 2} r={radius} fill="none" stroke={chartColors[index % chartColors.length]} strokeWidth={strokeWidth} />;
+          const startAngle = cumulativePercentage * 3.6;
+          const endAngle = startAngle + percentage * 3.6;
+          cumulativePercentage += percentage;
+          const outerStart = point(radius + strokeWidth / 2, startAngle);
+          const outerEnd = point(radius + strokeWidth / 2, endAngle);
+          const innerEnd = point(radius - strokeWidth / 2, endAngle);
+          const innerStart = point(radius - strokeWidth / 2, startAngle);
+          const largeArc = percentage > 50 ? 1 : 0;
+          const path = [
+            `M ${outerStart.x} ${outerStart.y}`,
+            `A ${radius + strokeWidth / 2} ${radius + strokeWidth / 2} 0 ${largeArc} 1 ${outerEnd.x} ${outerEnd.y}`,
+            `L ${innerEnd.x} ${innerEnd.y}`,
+            `A ${radius - strokeWidth / 2} ${radius - strokeWidth / 2} 0 ${largeArc} 0 ${innerStart.x} ${innerStart.y}`,
+            "Z",
+          ].join(" ");
+          return (
+            <Path
+              key={installment.id}
+              d={path}
+              fill={chartColors[index % chartColors.length]}
+            />
+          );
+        })}
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={compact ? 10 : 16}
+          fill={primaryColor}
+          stroke={accentColor}
+          strokeWidth={compact ? 1 : 1.5}
+        />
+      </Svg>
+      <Text
+        style={{
+          marginTop: compact ? -30 : -46,
+          marginBottom: compact ? 17 : 29,
+          color: "#ffffff",
+          fontSize: compact ? 7 : 10,
+          fontWeight: 700,
+        }}
+      >
+        {formatPercentage(calculation.totalPercentage)}
+      </Text>
+      <Text
+        style={{
+          color: primaryColor,
+          fontSize: compact ? 5.5 : 7,
+          fontWeight: 700,
+          textTransform: "uppercase",
+          letterSpacing: 0.5,
+        }}
+      >
+        Payment split
+      </Text>
+    </View>
+  );
+}
+
+function CompactSummaryCard({
+  width,
+  label,
+  primary,
+  secondary,
+  primaryColor,
+  accentColor,
+}: {
+  width: string;
+  label: string;
+  primary: string;
+  secondary: string;
+  primaryColor: string;
+  accentColor: string;
+}) {
+  return (
+    <View
+      style={[
+        offerStyles.summaryCard,
+        { width, minHeight: 39, padding: 5, backgroundColor: primaryColor },
+      ]}
+    >
       <Text style={[offerStyles.summaryLabel, { fontSize: 5.2 }]}>{label}</Text>
-      <Text style={[offerStyles.summaryPercent, { color: accentColor, fontSize: 10 }]}>{primary}</Text>
+      <Text style={[offerStyles.summaryPercent, { color: accentColor, fontSize: 10 }]}>
+        {primary}
+      </Text>
       <Text style={[offerStyles.summaryAmount, { fontSize: 5.8 }]}>{secondary}</Text>
     </View>
   );
 }
 
-function OnePagePaymentTable({ calculation, primaryColor }: { calculation: OfferCalculation; primaryColor: string }) {
+function OnePagePaymentTable({
+  calculation,
+  primaryColor,
+}: {
+  calculation: OfferCalculation;
+  primaryColor: string;
+}) {
   return (
     <View style={offerStyles.oneTable}>
-      <View style={[offerStyles.tableHeader, offerStyles.oneTableHeader, { backgroundColor: primaryColor }]}>
-        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colStage]}>Installment</Text>
-        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colPercent]}>%</Text>
-        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colAmount]}>Amount</Text>
-        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colDue]}>Due / period</Text>
+      <View
+        style={[
+          offerStyles.tableHeader,
+          offerStyles.oneTableHeader,
+          { backgroundColor: primaryColor },
+        ]}
+      >
+        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colStage]}>
+          Installment
+        </Text>
+        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colPercent]}>
+          %
+        </Text>
+        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colAmount]}>
+          Amount
+        </Text>
+        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colMonthly]}>
+          Monthly
+        </Text>
+        <Text style={[offerStyles.headerText, offerStyles.oneHeaderText, offerStyles.colDue]}>
+          Due / period
+        </Text>
       </View>
       {calculation.installments.map((installment, index) => (
         <View style={[offerStyles.tableRow, offerStyles.oneTableRow]} key={installment.id}>
-          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colStage]}>{index + 1}. {installment.label}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colPercent]}>{formatPercentage(installment.percentage)}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colAmount]}>{formatCurrency(installment.amount)}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colDue]}>{installment.due_label ?? installment.due_type ?? ""}</Text>
+          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colStage]}>
+            {index + 1}. {installment.label}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colPercent]}>
+            {formatPercentage(installment.percentage)}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colAmount]}>
+            {formatCurrency(installment.amount)}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colMonthly]}>
+            {installment.monthlyAmount == null
+              ? "—"
+              : `${formatCurrency(installment.monthlyAmount)} / mo`}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.oneCellText, offerStyles.colDue]}>
+            {installment.due_label ?? installment.due_type ?? ""}
+          </Text>
         </View>
       ))}
       <View style={[offerStyles.tableTotal, offerStyles.oneTableTotal]}>
-        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colStage]}>Total installments</Text>
-        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colPercent]}>{formatPercentage(calculation.totalPercentage)}</Text>
-        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colAmount]}>{formatCurrency(calculation.totalInstallmentAmount)}</Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colStage]}>
+          Total installments
+        </Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colPercent]}>
+          {formatPercentage(calculation.totalPercentage)}
+        </Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colAmount]}>
+          {formatCurrency(calculation.totalInstallmentAmount)}
+        </Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colMonthly]} />
         <Text style={[offerStyles.cellStrong, offerStyles.oneCellStrong, offerStyles.colDue]} />
       </View>
     </View>
@@ -431,7 +826,12 @@ function OnePagePaymentTable({ calculation, primaryColor }: { calculation: Offer
 }
 
 function OnePageFinancialRow({ label, value }: { label: string; value: string }) {
-  return <View style={[offerStyles.financialRow, offerStyles.oneFinancialRow]}><Text style={offerStyles.oneFinancialLabel}>{label}</Text><Text style={offerStyles.oneFinancialValue}>{value}</Text></View>;
+  return (
+    <View style={[offerStyles.financialRow, offerStyles.oneFinancialRow]}>
+      <Text style={offerStyles.oneFinancialLabel}>{label}</Text>
+      <Text style={offerStyles.oneFinancialValue}>{value}</Text>
+    </View>
+  );
 }
 
 function OfferHeader({
@@ -441,6 +841,7 @@ function OfferHeader({
   offerId,
   offerDate,
   validUntil,
+  floor,
 }: {
   project: ProjectWithRelations;
   heroImage: string;
@@ -448,6 +849,7 @@ function OfferHeader({
   offerId: string;
   offerDate: string;
   validUntil: string;
+  floor?: string | null;
 }) {
   return (
     <View style={[offerStyles.header, { backgroundColor: offerColors.navy }]}>
@@ -455,15 +857,48 @@ function OfferHeader({
       <View style={offerStyles.headerTextPanel}>
         <View style={offerStyles.headerContent}>
           {developerLogo && <Image src={developerLogo} style={offerStyles.logo} />}
-          {project.developer?.name && <Text style={[offerStyles.developer, { color: "#ffffff", opacity: 1 }]}>{project.developer.name}</Text>}
-          <Text style={[offerStyles.eyebrow, { color: offerColors.gold, opacity: 1 }]}>Sales offer</Text>
+          {project.developer?.name && (
+            <Text style={[offerStyles.developer, { color: "#ffffff", opacity: 1 }]}>
+              {project.developer.name}
+            </Text>
+          )}
+          <Text style={[offerStyles.eyebrow, { color: offerColors.gold, opacity: 1 }]}>
+            Sales offer
+          </Text>
           <Text style={[offerStyles.title, { color: "#ffffff", opacity: 1 }]}>INVESTMENT</Text>
-          <Text style={[offerStyles.subtitle, { color: offerColors.gold, opacity: 1 }]}>Proposal</Text>
-          <Text style={[offerStyles.projectName, { color: offerColors.gold, opacity: 1 }]}>{project.name}</Text>
-          {(project.community?.name ?? project.address) && <Text style={[offerStyles.location, { color: "#ffffff", opacity: 1 }]}>{project.community?.name ?? project.address}</Text>}
+          <Text style={[offerStyles.subtitle, { color: offerColors.gold, opacity: 1 }]}>
+            Proposal
+          </Text>
+          <Text style={[offerStyles.projectName, { color: offerColors.gold, opacity: 1 }]}>
+            {project.name}
+          </Text>
+          {(project.community?.name ?? project.address) && (
+            <Text style={[offerStyles.location, { color: "#ffffff", opacity: 1 }]}>
+              {project.community?.name ?? project.address}
+            </Text>
+          )}
         </View>
       </View>
-      <View style={[offerStyles.offerMeta, { borderColor: offerColors.gold, backgroundColor: offerColors.navy }]}>
+      <View style={[offerStyles.heroProjectRibbon, { borderColor: offerColors.gold }]}>
+        <Text style={offerStyles.heroProjectName}>{project.name}</Text>
+        {(project.community?.name ?? project.address) && (
+          <Text style={offerStyles.heroProjectLocation}>
+            {project.community?.name ?? project.address}
+          </Text>
+        )}
+      </View>
+      {floor && (
+        <View style={[offerStyles.floorBadge, { borderColor: offerColors.gold }]}>
+          <Text style={offerStyles.floorBadgeLabel}>Floor</Text>
+          <Text style={offerStyles.floorBadgeValue}>{floor}</Text>
+        </View>
+      )}
+      <View
+        style={[
+          offerStyles.offerMeta,
+          { borderColor: offerColors.gold, backgroundColor: offerColors.navy },
+        ]}
+      >
         <Text style={[offerStyles.metaLabel, { color: offerColors.gold }]}>Offer ID</Text>
         <Text style={offerStyles.metaValue}>{offerId}</Text>
         <Text style={[offerStyles.metaLabel, { color: offerColors.gold }]}>Date</Text>
@@ -475,7 +910,21 @@ function OfferHeader({
   );
 }
 
-function SummaryCard({ width, label, primary, secondary, primaryColor, accentColor }: { width: string; label: string; primary: string; secondary: string; primaryColor: string; accentColor: string }) {
+function SummaryCard({
+  width,
+  label,
+  primary,
+  secondary,
+  primaryColor,
+  accentColor,
+}: {
+  width: string;
+  label: string;
+  primary: string;
+  secondary: string;
+  primaryColor: string;
+  accentColor: string;
+}) {
   return (
     <View style={[offerStyles.summaryCard, { width, backgroundColor: primaryColor }]}>
       <Text style={offerStyles.summaryLabel}>{label}</Text>
@@ -485,27 +934,52 @@ function SummaryCard({ width, label, primary, secondary, primaryColor, accentCol
   );
 }
 
-function PaymentTable({ calculation, primaryColor }: { calculation: OfferCalculation; primaryColor: string }) {
+function PaymentTable({
+  calculation,
+  primaryColor,
+}: {
+  calculation: OfferCalculation;
+  primaryColor: string;
+}) {
   return (
     <View style={offerStyles.table}>
       <View style={[offerStyles.tableHeader, { backgroundColor: primaryColor }]}>
         <Text style={[offerStyles.headerText, offerStyles.colStage]}>Installment</Text>
         <Text style={[offerStyles.headerText, offerStyles.colPercent]}>% of price</Text>
         <Text style={[offerStyles.headerText, offerStyles.colAmount]}>Amount</Text>
+        <Text style={[offerStyles.headerText, offerStyles.colMonthly]}>Monthly</Text>
         <Text style={[offerStyles.headerText, offerStyles.colDue]}>Due / period</Text>
       </View>
       {calculation.installments.map((installment, index) => (
         <View style={offerStyles.tableRow} key={installment.id}>
-          <Text style={[offerStyles.cellText, offerStyles.colStage]}>{index + 1}. {installment.label}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.colPercent]}>{formatPercentage(installment.percentage)}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.colAmount]}>{formatCurrency(installment.amount)}</Text>
-          <Text style={[offerStyles.cellText, offerStyles.colDue]}>{installment.due_label ?? installment.due_type ?? ""}</Text>
+          <Text style={[offerStyles.cellText, offerStyles.colStage]}>
+            {index + 1}. {installment.label}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.colPercent]}>
+            {formatPercentage(installment.percentage)}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.colAmount]}>
+            {formatCurrency(installment.amount)}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.colMonthly]}>
+            {installment.monthlyAmount == null
+              ? "—"
+              : `${formatCurrency(installment.monthlyAmount)} / month`}
+          </Text>
+          <Text style={[offerStyles.cellText, offerStyles.colDue]}>
+            {installment.due_label ?? installment.due_type ?? ""}
+          </Text>
         </View>
       ))}
       <View style={offerStyles.tableTotal}>
         <Text style={[offerStyles.cellStrong, offerStyles.colStage]}>Total installments</Text>
-        <Text style={[offerStyles.cellStrong, offerStyles.colPercent]}>{formatPercentage(calculation.totalPercentage)}</Text>
-        <Text style={[offerStyles.cellStrong, offerStyles.colAmount]}>{formatCurrency(calculation.totalInstallmentAmount)}</Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.colPercent]}>
+          {formatPercentage(calculation.totalPercentage)}
+        </Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.colAmount]}>
+          {formatCurrency(calculation.totalInstallmentAmount)}
+        </Text>
+        <Text style={[offerStyles.cellStrong, offerStyles.colMonthly]} />
         <Text style={[offerStyles.cellStrong, offerStyles.colDue]} />
       </View>
     </View>
@@ -521,11 +995,27 @@ function FinancialRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Footer({ project, offerId, accentColor }: { project: ProjectWithRelations; offerId: string; accentColor: string }) {
+function Footer({
+  project,
+  offerId,
+  accentColor,
+}: {
+  project: ProjectWithRelations;
+  offerId: string;
+  accentColor: string;
+}) {
   return (
     <View style={offerStyles.footer} fixed>
-      <Text style={offerStyles.disclaimer}>Disclaimer: This document is generated from current listing data for information purposes. Availability, prices, fees, payment terms, images, and dates are subject to confirmation in the final sale documents.</Text>
-      <Text style={[offerStyles.footerBrand, { color: accentColor }]}>{project.developer?.name ?? project.name}{"\n"}{offerId}</Text>
+      <Text style={offerStyles.disclaimer}>
+        Disclaimer: This document is generated from current listing data for information purposes.
+        Availability, prices, fees, payment terms, images, and dates are subject to confirmation in
+        the final sale documents.
+      </Text>
+      <Text style={[offerStyles.footerBrand, { color: accentColor }]}>
+        {project.developer?.name ?? project.name}
+        {"\n"}
+        {offerId}
+      </Text>
     </View>
   );
 }

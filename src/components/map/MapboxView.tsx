@@ -4,6 +4,9 @@ import {
   DUBAI_BOUNDS,
   MAP_MAX_BOUNDS,
   ZOOM_OUT_BOUNDS,
+  MAP_MAX_ZOOM,
+  MAP_MIN_ZOOM_OFFSET,
+  MAP_PAN_CLAMP_EPSILON,
   DEFAULT_PITCH,
   DEFAULT_BEARING,
   DUBAI_CENTER,
@@ -23,6 +26,7 @@ import {
 // the water layer is actually added — never in the initial page bundle.
 import type { createWaterLayer as CreateWaterLayer } from "./WaterLayer";
 import type { createStationModelLayer as CreateStationModelLayer } from "./StationModelLayer";
+import type { createProjectModelLayer as CreateProjectModelLayer } from "./ProjectModelLayer";
 import { addRoadsLayers, setRoadsVisible } from "./roadsLayer";
 import type { ProjectWithRelations } from "@/lib/types";
 import { useFiltersStore } from "@/store/filters";
@@ -39,6 +43,8 @@ import {
   type ZoneRow,
   type ZoneCategory,
 } from "@/lib/zones";
+import type { LightPreset, MapCameraState } from "./mapTypes";
+import { recordMapboxInitialization, releaseMapboxLoad } from "@/features/usage/client";
 
 // Satellite land tint — a warm-sepia grade over the Maxar imagery. The land is a
 // PHOTO, so this adjusts the image rather than painting a flat colour. To change
@@ -74,7 +80,7 @@ type TrainMotionState = {
   lastRotation?: number;
 };
 
-export type LightPreset = "dawn" | "day" | "dusk" | "night";
+export type { LightPreset } from "./mapTypes";
 
 type Props = {
   accessToken: string;
@@ -88,8 +94,10 @@ type Props = {
   zones?: ZoneRow[];
   /** Which RY/STR/HH highlight buttons are currently on. */
   zoneCategories?: Set<ZoneCategory>;
-  camera: { lat: number; lng: number; zoom: number };
-  onCameraChange: (c: { lat: number; lng: number; zoom: number }) => void;
+  camera: MapCameraState;
+  /** Keep the last camera when a suspended tab was loaded again. */
+  skipOpeningFit?: boolean;
+  onCameraChange: (c: MapCameraState) => void;
   onReady?: () => void;
   /**
    * Fires with the live Mapbox map instance once it is ready (map + heavy layers
@@ -97,12 +105,17 @@ type Props = {
    * Editor to attach click handlers / draw sources to the active map.
    */
   onMapReady?: (map: mapboxgl.Map) => void;
+  /** Opens the project's preferred tour after a deliberate double click / tap. */
+  onProjectDoubleClick?: (projectId: string) => void;
   active: boolean;
   metroMode: boolean;
   trainMode: boolean;
   roadsMode: boolean;
   lightPreset: LightPreset;
   mode?: "satellite" | "3d";
+  tenantId?: string | null;
+  mapInstanceId: string;
+  reservationId?: string | null;
 };
 
 // Small SVG metro/train icon used for the project markers.
@@ -158,6 +171,11 @@ const PROJECT_MARKER_CSS = `
   box-shadow:0 2px 8px rgba(0,0,0,.35);transition:background .28s ease,color .28s ease}
 .proj-lm:hover .proj-nm{background:#fff}
 .proj-lm:has(.proj-pin.selected) .proj-nm{background:linear-gradient(158deg,#e9c766,#c19a3c);color:#1a1206}
+.project-model-popup .mapboxgl-popup-content{padding:8px 12px;border:1px solid rgba(201,168,76,.65);
+  border-radius:10px;background:rgba(9,16,24,.94);color:#f7edd2;font:700 12px/1.3 'Work Sans',Arial,sans-serif;
+  box-shadow:0 12px 30px rgba(0,0,0,.4)}
+.project-model-popup .mapboxgl-popup-tip{border-top-color:rgba(9,16,24,.94);border-bottom-color:rgba(9,16,24,.94)}
+.project-model-popup .mapboxgl-popup-close-button{color:#c9a84c;padding:1px 4px}
 @media (prefers-reduced-motion:reduce){.proj-pin,.proj-nm{transition:none}}`;
 
 function ensureProjectMarkerStyles() {
@@ -179,17 +197,26 @@ export function MapboxView({
   zones = [],
   zoneCategories,
   camera,
+  skipOpeningFit = false,
   onCameraChange,
   onReady,
   onMapReady,
+  onProjectDoubleClick,
   active,
   metroMode,
   trainMode,
   roadsMode,
   lightPreset,
   mode = "3d",
+  tenantId,
+  mapInstanceId,
+  reservationId,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const tenantIdRef = useRef(tenantId);
+  tenantIdRef.current = tenantId;
+  const projectDoubleClickRef = useRef(onProjectDoubleClick);
+  projectDoubleClickRef.current = onProjectDoubleClick;
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markersRef = useRef<Map<string, mapboxgl.Marker>>(new globalThis.Map());
   const trainMarkersRef = useRef<Map<string, mapboxgl.Marker>>(new globalThis.Map());
@@ -199,8 +226,9 @@ export function MapboxView({
   const trainRafRef = useRef<number | null>(null);
   const trainMotionRef = useRef<Map<string, TrainMotionState>>(new globalThis.Map());
   const stationModelRef = useRef<ReturnType<typeof import("./StationModelLayer").createStationModelLayer> | null>(null);
+  const projectModelRef = useRef<ReturnType<typeof import("./ProjectModelLayer").createProjectModelLayer> | null>(null);
   const styleLoadedRef = useRef(false);
-  const didFitWholeRef = useRef(false); // one-time: open framed on the whole map
+  const didFitWholeRef = useRef(skipOpeningFit); // one-time: open framed on the whole map
   const tightMinZoomRef = useRef<number | null>(null); // fit zoom for MAP_MAX_BOUNDS (pan-clamp floor)
   const openZoomRef = useRef<number | null>(null); // fit zoom for DUBAI_BOUNDS (opening frame)
   const stationInteractionAddedRef = useRef(false);
@@ -268,7 +296,9 @@ export function MapboxView({
     const mobilePitch = mode === "3d" ? 42 : 0;
     const mobileZoom = mode === "3d" ? Math.min(camera.zoom, 11.5) : Math.min(camera.zoom, 10.5);
 
-    const map = new mapboxgl.Map({
+    let map: mapboxgl.Map;
+    try {
+      map = new mapboxgl.Map({
       container: containerRef.current,
       // Satellite mode → flat Mapbox satellite imagery; 3D mode → Standard style.
       style:
@@ -277,8 +307,8 @@ export function MapboxView({
           : "mapbox://styles/mapbox/satellite-streets-v12",
       center: [camera.lng, camera.lat],
       zoom: isMobile ? mobileZoom : camera.zoom,
-      pitch: isMobile ? mobilePitch : 0,
-      bearing: 0,
+      pitch: isMobile ? mobilePitch : camera.pitch == null ? 0 : Math.max(0, Math.min(85, camera.pitch + 90)),
+      bearing: camera.heading ?? 0,
       // Mapbox's maxBounds clamps zoom-out as well as panning: it keeps the box
       // filling the viewport, so a tight box also caps how far you can pull
       // back. Hand it the WIDE rect so zooming out can actually show more area;
@@ -287,11 +317,23 @@ export function MapboxView({
         [ZOOM_OUT_BOUNDS.west, ZOOM_OUT_BOUNDS.south],
         [ZOOM_OUT_BOUNDS.east, ZOOM_OUT_BOUNDS.north],
       ],
-      maxZoom: 18, // deep zoom-in to street/building level
+      maxZoom: MAP_MAX_ZOOM, // deep zoom-in to street/building level
 
       // MSAA sharpens 3D building edges but costs fill-rate, most painfully on
       // high-DPI phones. Keep it on desktop, drop it on mobile for smoother frames.
       antialias: !isMobile,
+      });
+    } catch (error) {
+      if (reservationId) void releaseMapboxLoad(reservationId);
+      throw error;
+    }
+    // Mapbox defines a billable web map load as a Map object initialization.
+    // Wait for this instance's first successful load so failed constructors are
+    // not metered; pan/zoom/click handlers never call this path.
+    let initializationRecorded = false;
+    map.once("load", () => {
+      initializationRecorded = true;
+      recordMapboxInitialization(mapInstanceId, mode, tenantIdRef.current, reservationId);
     });
 
     // Two separate fits, computed per-viewport (cameraForBounds fits the tighter
@@ -315,7 +357,7 @@ export function MapboxView({
       const open = fitZoomFor(DUBAI_BOUNDS); // OPENING frame — Dubai only, not the whole region
       // +1: hold the zoom-out floor one level tighter than the full ZOOM_OUT_BOUNDS
       // fit, so the user can't pull back quite as far.
-      if (typeof wide?.zoom === "number") map.setMinZoom(wide.zoom + 1);
+      if (typeof wide?.zoom === "number") map.setMinZoom(wide.zoom + MAP_MIN_ZOOM_OFFSET);
       if (typeof tight?.zoom === "number") tightMinZoomRef.current = tight.zoom;
       if (open && typeof open.zoom === "number") {
         openZoomRef.current = open.zoom;
@@ -393,7 +435,7 @@ export function MapboxView({
     function syncPanBounds() {
       if (clamping) return;
       const floor = tightMinZoomRef.current;
-      if (floor != null && map.getZoom() >= floor + 0.05) {
+      if (floor != null && map.getZoom() >= floor + MAP_PAN_CLAMP_EPSILON) {
         clamping = true;
         // finally: never leave the flag stuck true if setCenter throws, or the
         // clamp would silently stop working for the rest of the session.
@@ -558,8 +600,9 @@ export function MapboxView({
     });
 
     map.on("moveend", () => {
+      if (!isActiveRef.current) return;
       const c = map.getCenter();
-      onCameraChange({ lat: c.lat, lng: c.lng, zoom: map.getZoom() });
+      onCameraChange({ lat: c.lat, lng: c.lng, zoom: map.getZoom(), heading: map.getBearing(), pitch: map.getPitch() - 90 });
     });
 
     mapRef.current = map;
@@ -588,6 +631,7 @@ export function MapboxView({
       readySignaledRef.current = false;
       pendingHeavyLayersRef.current = null;
       map.remove();
+      if (!initializationRecorded && reservationId) void releaseMapboxLoad(reservationId);
       mapRef.current = null;
       projectMarkers.clear();
       activeTrainMarkers.clear();
@@ -883,6 +927,32 @@ export function MapboxView({
       stationModelRef.current = handle;
     } catch (err) {
       console.error("Failed to add station model layer", err);
+    }
+  }
+
+  async function addProjectModelLayer(map: mapboxgl.Map, project: ProjectWithRelations) {
+    if (mode !== "3d" || !project.model_3d_enabled || !project.model_3d_url?.startsWith("https://")) return;
+    try {
+      const { createProjectModelLayer } = await import("./ProjectModelLayer");
+      if (!mapRef.current || mapRef.current !== map || selectedIdRef.current !== project.id) return;
+      const handle = (createProjectModelLayer as typeof CreateProjectModelLayer)(
+        makeRenderController(),
+        {
+          projectId: project.id,
+          projectName: project.name,
+          url: project.model_3d_url,
+          lat: project.model_3d_lat ?? project.lat,
+          lng: project.model_3d_lng ?? project.lng,
+          altitude: project.model_3d_altitude ?? 0,
+          scale: project.model_3d_scale ?? 1,
+          rotation: project.model_3d_rotation ?? 0,
+        },
+      );
+      map.addLayer(handle.layer);
+      stubCustomLayerPaint(map, "selected-project-digital-twin");
+      projectModelRef.current = handle;
+    } catch (err) {
+      console.error("Failed to add the selected project's 3D model", err);
     }
   }
 
@@ -1438,11 +1508,9 @@ export function MapboxView({
     ) as Record<string, { id: string; progress: number }[]>;
 
     const tick = (now: number) => {
-      // Skip the per-marker work when this map instance is inactive (the other
-      // mode's hidden map) or the tab is hidden — keep the rAF alive so it
-      // resumes automatically. The dt cap below prevents a jump on resume.
+      // Stop the loop while Cesium owns the screen or the tab is hidden.
       if (!isActiveRef.current || !isVisibleRef.current) {
-        trainRafRef.current = requestAnimationFrame(tick);
+        trainRafRef.current = null;
         return;
       }
       for (const line of ALL_RAIL_LINES) {
@@ -1565,7 +1633,6 @@ export function MapboxView({
       return;
     }
     setRoadsVisible(map, roadsMode);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roadsMode]);
 
   // Switch Mapbox Standard's built-in light preset (day/dawn/dusk/night) live,
@@ -1590,6 +1657,8 @@ export function MapboxView({
       // If this map became visible again and is the active one, kick the render loops back on.
       if (isVisibleRef.current && isActiveRef.current && mapRef.current) {
         mapRef.current.triggerRepaint();
+        for (const train of trainMotionRef.current.values()) train.last = performance.now();
+        if (trainMarkersRef.current.size) ensureTrainLoop();
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -1603,6 +1672,8 @@ export function MapboxView({
     const map = mapRef.current;
 
     if (active) {
+      for (const train of trainMotionRef.current.values()) train.last = performance.now();
+      if (trainMarkersRef.current.size) ensureTrainLoop();
       const isMobile = window.innerWidth < 768;
       const mobilePitch = mode === "3d" ? 42 : 0;
       const mobileZoom = mode === "3d" ? 11.5 : 10.5;
@@ -1612,8 +1683,8 @@ export function MapboxView({
       map.jumpTo({
         center: [camera.lng, camera.lat],
         zoom: isMobile ? Math.min(camera.zoom, mobileZoom) : camera.zoom,
-        pitch: isMobile ? mobilePitch : 0,
-        bearing: 0,
+        pitch: isMobile ? mobilePitch : camera.pitch == null ? 0 : Math.max(0, Math.min(85, camera.pitch + 90)),
+        bearing: camera.heading ?? 0,
       });
       // Extra resizes after the mode-switch transition settles, so the canvas
       // never ends up sized to the old (hidden/zero) container → no black bands.
@@ -1674,6 +1745,8 @@ export function MapboxView({
     } else {
       // Cancel any in-flight animations when this instance becomes inactive.
       map.stop();
+      if (trainRafRef.current != null) cancelAnimationFrame(trainRafRef.current);
+      trainRafRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
@@ -1708,6 +1781,27 @@ export function MapboxView({
       el.append(pin, nm);
       el.title = p.name; // name also shown as native tooltip on hover
       el.onclick = () => setSelectedProjectId(p.id);
+      el.ondblclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        projectDoubleClickRef.current?.(p.id);
+      };
+      // Mobile browsers are inconsistent about synthesizing dblclick on map
+      // markers, so recognise a deliberate second touch without affecting the
+      // existing single-tap selection behaviour.
+      let lastTouchAt = 0;
+      el.onpointerup = (event) => {
+        if (event.pointerType !== "touch") return;
+        const now = performance.now();
+        if (now - lastTouchAt > 0 && now - lastTouchAt <= 420) {
+          lastTouchAt = 0;
+          event.preventDefault();
+          event.stopPropagation();
+          projectDoubleClickRef.current?.(p.id);
+          return;
+        }
+        lastTouchAt = now;
+      };
       // Hover syncs the shared highlight (sidebar card ⇄ marker) and fades this
       // project's plot in; leaving recomputes so a pinned/selected plot stays.
       el.onmouseenter = () => {
@@ -1771,6 +1865,28 @@ export function MapboxView({
     if (!map || !mapReady) return;
     recomputePlots(map);
   }, [selectedProjectId, pinnedPlotIds, projects, mapReady, recomputePlots]);
+
+  // Load only the selected project's detailed digital twin. Architectural GLB
+  // files are intentionally never loaded for the full project list: that keeps
+  // the overview fast even when many projects have high-detail models.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const layerId = "selected-project-digital-twin";
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+    projectModelRef.current = null;
+    if (!active || mode !== "3d" || !selectedProjectId) return;
+    const project = projects.find((item) => item.id === selectedProjectId);
+    if (!project) return;
+    void addProjectModelLayer(map, project);
+
+    return () => {
+      if (mapRef.current === map && map.getLayer(layerId)) map.removeLayer(layerId);
+      projectModelRef.current = null;
+    };
+    // The helper intentionally reads the latest render-controller refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, mapReady, mode, projects, selectedProjectId]);
 
   // Landmark places (tourism / schools / hospitals) — ONE Mapbox symbol layer.
   // `pois` already holds only the active categories, so refreshing the layer's
@@ -1860,10 +1976,11 @@ export function MapboxView({
     if (!map || !active || !selectedProjectId) return;
     const p = projects.find((x) => x.id === selectedProjectId);
     if (!p) return;
+    const hasDigitalTwin = mode === "3d" && p.model_3d_enabled && Boolean(p.model_3d_url);
     map.flyTo({
       center: [p.lng, p.lat],
-      zoom: Math.max(map.getZoom(), 15.5),
-      pitch: mode === "3d" ? 55 : 0,
+      zoom: Math.max(map.getZoom(), hasDigitalTwin ? 17.2 : 15.5),
+      pitch: mode === "3d" ? (hasDigitalTwin ? 62 : 55) : 0,
       bearing: map.getBearing(),
       duration: 1500,
       essential: true,

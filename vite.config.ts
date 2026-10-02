@@ -1,8 +1,11 @@
-import { defineConfig, loadEnv } from "vite";
+import path from "node:path";
+import { readFile } from "node:fs/promises";
+import { defineConfig, loadEnv, normalizePath, type PluginOption } from "vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import tsConfigPaths from "vite-tsconfig-paths";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import { viteStaticCopy } from "vite-plugin-static-copy";
 
 export default defineConfig(async ({ command, mode }) => {
   // Expose VITE_* to import.meta.env for the SSR/nitro runtime too.
@@ -10,9 +13,18 @@ export default defineConfig(async ({ command, mode }) => {
   const define: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) define[`import.meta.env.${k}`] = JSON.stringify(v);
 
-  const plugins = [
+  const plugins: PluginOption[] = [
     tailwindcss(),
     tsConfigPaths({ projects: ["./tsconfig.json"] }),
+    viteStaticCopy({
+      targets: ["Assets", "ThirdParty", "Widgets", "Workers"].map((directory) => ({
+        src: normalizePath(
+          path.resolve(process.cwd(), "node_modules/cesium/Build/Cesium", directory, "**/*"),
+        ),
+        dest: `cesium/${directory}`,
+        rename: { stripBase: 5 },
+      })),
+    }),
     tanstackStart({
       // src/server.ts wraps SSR error handling.
       server: { entry: "server" },
@@ -24,13 +36,41 @@ export default defineConfig(async ({ command, mode }) => {
     viteReact(),
   ];
 
+  // An isolated development QA page, never a production route or database seed.
+  if (command === "serve") {
+    plugins.unshift({
+      name: "keyora-photorealistic-qa",
+      configureServer(server) {
+        server.middlewares.use("/qa/photorealistic.html", async (request, response, next) => {
+          if (request.method !== "GET") return next();
+          try {
+            const html = await readFile(path.resolve(process.cwd(), "qa/photorealistic.html"), "utf8");
+            response.setHeader("Content-Type", "text/html; charset=utf-8");
+            response.end(await server.transformIndexHtml("/qa/photorealistic.html", html));
+          } catch (error) { next(error); }
+        });
+      },
+    });
+  }
+
   // Nitro produces the deploy bundle — build only. defaultPreset is the fallback
   // when NITRO_PRESET is unset (local builds → cloudflare-module); on Vercel the
   // NITRO_PRESET=vercel env from vercel.json wins, so use defaultPreset (not
   // preset) to avoid forcing the wrong target.
   if (command === "build") {
     const { nitro } = await import("nitro/vite");
-    plugins.splice(3, 0, nitro({ defaultPreset: "cloudflare-module" }));
+    plugins.splice(
+      3,
+      0,
+      nitro({
+        defaultPreset: "cloudflare-module",
+        publicAssets: ["Assets", "ThirdParty", "Widgets", "Workers"].map((directory) => ({
+          dir: `node_modules/cesium/Build/Cesium/${directory}`,
+          baseURL: `/cesium/${directory}`,
+          maxAge: 31_536_000,
+        })),
+      }),
+    );
   }
 
   return {

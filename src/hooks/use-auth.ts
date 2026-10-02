@@ -2,19 +2,64 @@ import { useEffect, useState } from "react";
 import type { Session, User } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
 import { useQuery } from "@tanstack/react-query";
+import { clearSessionWindow, getSessionExpiresAt } from "@/lib/auth-session";
+
+const SESSION_EXPIRED_NOTICE_KEY = "dubai:session-expired";
 
 export function useAuth() {
   const [session, setSession] = useState<Session | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
+    const acceptSession = (nextSession: Session | null, forceUserUpdate = false) => {
+      setSession((current) =>
+        current?.access_token === nextSession?.access_token && current?.expires_at === nextSession?.expires_at
+          ? current
+          : nextSession,
+      );
+      const nextUser = nextSession?.user ?? null;
+      setUser((current) =>
+        !forceUserUpdate && current?.id === nextUser?.id && current?.updated_at === nextUser?.updated_at
+          ? current
+          : nextUser,
+      );
       setReady(true);
+    };
+    supabase.auth.getSession().then(({ data }) => {
+      acceptSession(data.session);
     });
-    const { data: sub } = supabase.auth.onAuthStateChange((_ev, s) => setSession(s));
+    const { data: sub } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      acceptSession(nextSession, event === "USER_UPDATED");
+    });
     return () => sub.subscription.unsubscribe();
   }, []);
-  return { session, user: session?.user ?? null as User | null, ready };
+
+  useEffect(() => {
+    if (!session || typeof window === "undefined") return;
+
+    const expiresAt = getSessionExpiresAt(session);
+    if (expiresAt == null) return;
+
+    const expire = () => {
+      window.sessionStorage.setItem(SESSION_EXPIRED_NOTICE_KEY, "1");
+      clearSessionWindow(session);
+      setSession(null);
+      setUser(null);
+      void supabase.auth.signOut({ scope: "local" });
+    };
+
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      expire();
+      return;
+    }
+
+    const timeout = window.setTimeout(expire, remaining);
+    return () => window.clearTimeout(timeout);
+  }, [session]);
+
+  return { session, user, ready };
 }
 
 export function useIsAdmin(user: User | null) {

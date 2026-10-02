@@ -2,7 +2,7 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import { Search, LogIn, LogOut, LayoutDashboard, UserPlus, UserRound } from "lucide-react";
 import { useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
+import { useAuth, useIsAdmin } from "@/hooks/use-auth";
 import { useFiltersStore } from "@/store/filters";
 import { useTenantStore } from "@/store/tenant";
 import { Input } from "@/components/ui/input";
@@ -13,12 +13,14 @@ const NAV = [
   { to: "/", label: "Map" },
   { to: "/communities", label: "Communities" },
   { to: "/developers", label: "Developers" },
+  { to: "/privacy", label: "Privacy" },
 ] as const;
 
 export function AppNavbar() {
   const path = useRouterState({ select: (r) => r.location.pathname });
   const { filters, setFilters } = useFiltersStore();
   const { user } = useAuth();
+  const { data: isPlatformAdmin = false } = useIsAdmin(user);
   const { tenants, currentTenantId, loaded: tenantLoaded, load: loadTenants } = useTenantStore();
 
   // The workspace is tenant-membership based. The old user_roles check only
@@ -40,9 +42,14 @@ export function AppNavbar() {
   // The current org's remaining access, shown under the name so a user can see
   // their own renewal date without visiting the billing page.
   const period = currentTenant
-    ? formatSubscriptionPeriod(currentTenant.current_period_end, currentTenant.subscription_status, {
-        suspended: currentTenant.suspended,
-      })
+    ? formatSubscriptionPeriod(
+        currentTenant.current_period_end,
+        currentTenant.subscription_status,
+        {
+          suspended: currentTenant.suspended,
+          lifetime: isPlatformAdmin,
+        },
+      )
     : null;
 
   return (
@@ -57,7 +64,9 @@ export function AppNavbar() {
       // static rather than scroll-reactive: `html, body, #root { height: 100% }`
       // in styles.css means the window never scrolls on any route (each page
       // scrolls an inner container), so a scroll listener would never fire.
-      style={{ boxShadow: "inset 0 1px 0 oklch(1 0 0 / 0.10), 0 14px 34px -26px oklch(0 0 0 / 0.8)" }}
+      style={{
+        boxShadow: "inset 0 1px 0 oklch(1 0 0 / 0.10), 0 14px 34px -26px oklch(0 0 0 / 0.8)",
+      }}
     >
       <div className="relative mx-auto flex h-16 max-w-[1600px] items-center gap-3 px-4">
         <Link to="/" className="group flex shrink-0 items-center gap-2.5" aria-label="KEYORA home">
@@ -120,7 +129,12 @@ export function AppNavbar() {
           {user ? (
             <>
               {canOpenWorkspace && (
-                <Button asChild size="sm" variant="ghost" className="shrink-0 text-cream hover:bg-white/[0.07] hover:text-gold">
+                <Button
+                  asChild
+                  size="sm"
+                  variant="ghost"
+                  className="shrink-0 text-cream hover:bg-white/[0.07] hover:text-gold"
+                >
                   <Link to="/admin">
                     <LayoutDashboard className="mr-1 h-4 w-4" />{" "}
                     <span className="hidden lg:inline">Admin</span>
@@ -165,7 +179,12 @@ export function AppNavbar() {
             </>
           ) : (
             <>
-              <Button asChild size="sm" variant="ghost" className="shrink-0 px-2 text-cream hover:bg-white/[0.07] hover:text-gold sm:px-3">
+              <Button
+                asChild
+                size="sm"
+                variant="ghost"
+                className="shrink-0 px-2 text-cream hover:bg-white/[0.07] hover:text-gold sm:px-3"
+              >
                 <Link to="/signup">
                   {/* Icon-only below sm: at 390px the label squeezed the search
                       field until its placeholder was cut off mid-word. */}

@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import MapboxDraw from "@mapbox/mapbox-gl-draw";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
-import { X } from "lucide-react";
+import { Pencil, Pentagon, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ZOOM_OUT_BOUNDS } from "@/lib/dubai";
+import { recordMapboxInitialization } from "@/features/usage/client";
 import {
   drawnPolygon,
   normalizePolygon,
@@ -79,11 +81,16 @@ export function ProjectPlotEditor({ accessToken, lat, lng, value, onChange }: Pr
   useEffect(() => {
     if (!containerRef.current || !accessToken) return;
     mapboxgl.accessToken = accessToken;
+    const mapInstanceId = crypto.randomUUID();
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/satellite-streets-v12",
       center: [lngRef.current, latRef.current],
       zoom: 15.5,
+      maxBounds: [
+        [ZOOM_OUT_BOUNDS.west, ZOOM_OUT_BOUNDS.south],
+        [ZOOM_OUT_BOUNDS.east, ZOOM_OUT_BOUNDS.north],
+      ],
     });
     map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "top-right");
     const draw = new MapboxDraw({ displayControlsDefault: false, controls: { polygon: true, trash: true } });
@@ -92,6 +99,7 @@ export function ProjectPlotEditor({ accessToken, lat, lng, value, onChange }: Pr
     map.on("draw.update", sync);
     map.on("draw.delete", sync);
     map.on("load", () => {
+      recordMapboxInitialization(mapInstanceId, "admin_plot_editor");
       setTimeout(() => map.resize(), 60);
       // Show the project's location so the admin can trace the plot around it.
       const dot = document.createElement("div");
@@ -133,14 +141,32 @@ export function ProjectPlotEditor({ accessToken, lat, lng, value, onChange }: Pr
     }
     emittedRef.current = value;
     validate(value);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value, ready]);
 
   const clear = () => {
     drawRef.current?.deleteAll();
+    drawRef.current?.changeMode("simple_select");
     emittedRef.current = null;
     onChange(null);
     validate(null);
+  };
+
+  const editPoints = () => {
+    const draw = drawRef.current;
+    if (!draw) return;
+    const polygon = draw.getAll().features.find((feature) => feature.geometry?.type === "Polygon");
+    if (polygon?.id == null) return;
+    draw.changeMode("direct_select", { featureId: String(polygon.id) });
+  };
+
+  const redraw = () => {
+    const draw = drawRef.current;
+    if (!draw) return;
+    draw.deleteAll();
+    emittedRef.current = null;
+    onChange(null);
+    validate(null);
+    draw.changeMode("draw_polygon");
   };
 
   return (
@@ -148,15 +174,33 @@ export function ProjectPlotEditor({ accessToken, lat, lng, value, onChange }: Pr
       <div className="overflow-hidden rounded-xl border border-gold/20">
         <div ref={containerRef} className="h-[280px] w-full bg-[#d9eef2]" />
       </div>
-      <div className="mt-2 flex items-center justify-between gap-3 text-xs">
-        <span className="text-muted-foreground">
-          {areaM2 != null ? `Area: ${formatArea(areaM2)}` : "Use the polygon tool to trace the plot boundary."}
-        </span>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {value ? (
+          <>
+            <Button type="button" variant="outline" size="sm" onClick={editPoints}>
+              <Pencil className="mr-1.5 h-3.5 w-3.5" /> Edit boundary points
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={redraw}>
+              <Pentagon className="mr-1.5 h-3.5 w-3.5" /> Redraw boundary
+            </Button>
+          </>
+        ) : (
+          <Button type="button" variant="outline" size="sm" onClick={redraw}>
+            <Pentagon className="mr-1.5 h-3.5 w-3.5" /> Draw plot boundary
+          </Button>
+        )}
         {value && (
           <Button type="button" variant="ghost" size="sm" onClick={clear} className="text-muted-foreground">
             <X className="mr-1 h-3.5 w-3.5" /> Clear plot
           </Button>
         )}
+      </div>
+      <div className="mt-2 flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">
+          {areaM2 != null
+            ? `Area: ${formatArea(areaM2)} · Select Edit boundary points, then drag any vertex on the map.`
+            : "Select Draw plot boundary, click around the land parcel, then double-click the last point."}
+        </span>
       </div>
       {warning && (
         <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">

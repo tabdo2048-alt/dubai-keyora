@@ -1,38 +1,35 @@
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { withSignedProjectMedia } from "@/lib/media";
-import type { ProjectWithRelations, ProjectFilters, ProjectRow } from "@/lib/types";
+import { sbAny } from "@/integrations/supabase/saas";
+import { resolveMediaThumbnailUrls, resolveMediaUrls, withSignedProjectMedia } from "@/lib/media";
+import type { ProjectWithRelations, ProjectFilters, ProjectRow, ProjectUnitTypeImageRow } from "@/lib/types";
 import { lowestUnitPrice } from "@/lib/unit-types";
 
 export function projectsQueryKey() {
   return ["projects", "list"] as const;
 }
 
-// `unit_types` is selected with `*` rather than a column list on purpose. Naming
-// area_sqm_min/max here would make the WHOLE project list 400 on a database where
-// supabase/migrations/20260818000000_unit_area_square_meters.sql has not been
-// applied yet — one missing column would cost every project, price and marker on
-// the map. With `*`, an un-migrated database simply returns the old sqft columns,
-// nothing reads them, and the area line hides itself.
+// The map only needs compact unit card/pricing fields. A database missing the
+// optional area migration falls back to the legacy selection below.
 const PROJECT_LIST_SELECT = `
   id,slug,name,developer_id,community_id,lat,lng,address,starting_price_aed,
   bedrooms_min,bedrooms_max,bathrooms,completion_date,payment_plan,status,category,
-  tags,description,main_image_url,offer_primary_color,offer_accent_color,offer_header_image_url,
-  video_url,tour_360_url,brochure_url,featured,
+  tags,description,main_image_url,video_url,tour_360_url,featured,
+  model_3d_url,model_3d_enabled,model_3d_lat,model_3d_lng,model_3d_altitude,model_3d_scale,model_3d_rotation,
   created_at,updated_at,plot_geometry,plot_color,is_public,tenant_id,
-  developer:developers(*),
+  developer:developers(id,name,slug,logo_url),
   community:communities(id,name,slug),
-  unit_types:project_unit_types(*)
+  unit_types:project_unit_types(id,label,price_aed,area_sqm_min,area_sqm_max,floor,sort_order,availability)
 `;
 
-// The offer-branding columns are optional until their migration is applied.
-// Retry without them so an older database can still list and edit projects.
-const PROJECT_LIST_SELECT_LEGACY_BRANDING = `
+// Older databases without the optional area columns retain their legacy unit
+// select; the modern path avoids fetching those unused unit fields.
+const PROJECT_LIST_SELECT_LEGACY_AREA = `
   id,slug,name,developer_id,community_id,lat,lng,address,starting_price_aed,
   bedrooms_min,bedrooms_max,bathrooms,completion_date,payment_plan,status,category,
   tags,description,main_image_url,video_url,tour_360_url,brochure_url,featured,
   created_at,updated_at,plot_geometry,plot_color,is_public,tenant_id,
-  developer:developers(*),
+  developer:developers(id,name,slug,logo_url),
   community:communities(id,name,slug),
   unit_types:project_unit_types(*)
 `;
@@ -114,11 +111,13 @@ async function fetchAllProjects(): Promise<ProjectWithRelations[]> {
   if (isMissingColumn(error)) {
     const retry = await supabase
       .from("projects")
-      .select(PROJECT_LIST_SELECT_LEGACY_BRANDING)
+      .select(PROJECT_LIST_SELECT_LEGACY_AREA)
       .order("featured", { ascending: false })
       .order("created_at", { ascending: false });
     if (!retry.error) return withSignedProjectMedia(normalizeProjects(retry.data ?? []), { includeGallery: false, thumbnailsOnly: true });
+    if (!isMissingRelation(retry.error)) throw retry.error;
   }
+  if (!isMissingColumn(error) && !isMissingRelation(error)) throw error;
   console.warn("[Projects] full query failed; falling back to legacy schema", error.message);
   return fetchLegacyProjects();
 }
@@ -127,7 +126,8 @@ export function useProjects() {
   return useQuery({
     queryKey: projectsQueryKey(),
     queryFn: fetchAllProjects,
-    staleTime: 60_000,
+    staleTime: 5 * 60_000,
+    gcTime: 15 * 60_000,
   });
 }
 
@@ -136,7 +136,9 @@ export function useProjects() {
 export async function fetchProjectBySlug(slug: string): Promise<ProjectWithRelations | null> {
   const { data, error } = await supabase
     .from("projects")
-    .select(PROJECT_DETAIL_SELECT_WITH_PLANS)
+    // Public project pages need unit prices/details, but unit photos belong to
+    // the selected unit page and are fetched there on demand.
+    .select(PROJECT_DETAIL_SELECT_WITH_PLANS_LEGACY_UNIT_IMAGES)
     .eq("slug", slug)
     .maybeSingle();
   if (!error && data) return signOne(normalizeProject(data));
@@ -147,38 +149,20 @@ export async function fetchProjectBySlug(slug: string): Promise<ProjectWithRelat
   if (isMissingRelation(error)) {
     const retry = await supabase
       .from("projects")
-      .select(PROJECT_DETAIL_SELECT_PLANS)
+      .select(PROJECT_DETAIL_SELECT_PLANS_LEGACY_UNIT_IMAGES)
       .eq("slug", slug)
       .maybeSingle();
     if (!retry.error && retry.data) return signOne(normalizeProject(retry.data));
     if (!retry.error) return fetchProjectByReadableSlug(slug);
 
-    // The payment-plan relation may exist while the optional unit-photo
-    // relation is not installed yet. Drop only that relation before falling
-    // back to the older plan query.
-    const plansWithoutUnitImages = await supabase
-      .from("projects")
-      .select(PROJECT_DETAIL_SELECT_WITH_PLANS_LEGACY_UNIT_IMAGES)
-      .eq("slug", slug)
-      .maybeSingle();
-    if (!plansWithoutUnitImages.error && plansWithoutUnitImages.data) return signOne(normalizeProject(plansWithoutUnitImages.data));
-    if (!plansWithoutUnitImages.error) return fetchProjectByReadableSlug(slug);
-
     const baseRetry = await supabase
       .from("projects")
-      .select(PROJECT_DETAIL_SELECT_BASE)
+      .select(PROJECT_DETAIL_SELECT_BASE_LEGACY_UNIT_IMAGES)
       .eq("slug", slug)
       .maybeSingle();
     if (!baseRetry.error && baseRetry.data) return signOne(normalizeProject(baseRetry.data));
     if (!baseRetry.error) return fetchProjectByReadableSlug(slug);
 
-    const baseWithoutUnitImages = await supabase
-      .from("projects")
-      .select(PROJECT_DETAIL_SELECT_BASE_LEGACY_UNIT_IMAGES)
-      .eq("slug", slug)
-      .maybeSingle();
-    if (!baseWithoutUnitImages.error && baseWithoutUnitImages.data) return signOne(normalizeProject(baseWithoutUnitImages.data));
-    if (!baseWithoutUnitImages.error) return fetchProjectByReadableSlug(slug);
   }
 
   console.warn("[Projects] full project query failed; falling back to legacy schema", error.message);
@@ -196,6 +180,11 @@ export async function fetchProjectBySlug(slug: string): Promise<ProjectWithRelat
 async function fetchProjectByReadableSlug(input: string): Promise<ProjectWithRelations | null> {
   const requested = slugify(input);
   if (!requested) return null;
+
+  const lookup = await sbAny.rpc("find_project_by_readable_slug", { _slug: requested });
+  if (!lookup.error) return lookup.data ? fetchPublicProjectById(String(lookup.data)) : null;
+  // Compatibility for databases awaiting the route-lookup migration only.
+  if (lookup.error.code !== "PGRST202" && lookup.error.code !== "42883") throw lookup.error;
 
   const { data, error } = await supabase
     .from("projects")
@@ -218,7 +207,43 @@ async function fetchProjectByReadableSlug(input: string): Promise<ProjectWithRel
     ].includes(requested);
   });
 
-  return candidate ? fetchProjectById(candidate.id) : null;
+  return candidate ? fetchPublicProjectById(candidate.id) : null;
+}
+
+async function fetchPublicProjectById(id: string): Promise<ProjectWithRelations | null> {
+  const attempts = [
+    PROJECT_DETAIL_SELECT_WITH_PLANS_LEGACY_UNIT_IMAGES,
+    PROJECT_DETAIL_SELECT_PLANS_LEGACY_UNIT_IMAGES,
+    PROJECT_DETAIL_SELECT_BASE_LEGACY_UNIT_IMAGES,
+  ];
+  for (const select of attempts) {
+    const { data, error } = await supabase.from("projects").select(select).eq("id", id).maybeSingle();
+    if (!error) return signOne(normalizeProject(data));
+    if (!isMissingRelation(error)) throw error;
+  }
+  return null;
+}
+
+export async function fetchUnitImages(unitTypeId: string): Promise<Array<ProjectUnitTypeImageRow & { src: string; thumb_src: string }>> {
+  const { data, error } = await supabase
+    .from("project_unit_type_images")
+    .select("*")
+    .eq("unit_type_id", unitTypeId)
+    .order("sort_order");
+  if (error) throw error;
+  const rows = (data ?? []) as ProjectUnitTypeImageRow[];
+  const values = rows.map((image) => image.url);
+  const [full, thumbs] = await Promise.all([resolveMediaUrls(values), resolveMediaThumbnailUrls(values)]);
+  return rows.map((image) => ({ ...image, src: full.get(image.url) ?? image.url, thumb_src: thumbs.get(image.url) ?? full.get(image.url) ?? image.url }));
+}
+
+export function useUnitImages(unitTypeId: string | null) {
+  return useQuery({
+    queryKey: ["unit-images", unitTypeId],
+    queryFn: () => fetchUnitImages(unitTypeId!),
+    enabled: Boolean(unitTypeId),
+    staleTime: 50 * 60 * 1000,
+  });
 }
 
 /** Full project fetch used by the admin editor without loading every project. */
@@ -272,10 +297,12 @@ async function signOne(project: ProjectWithRelations | null): Promise<ProjectWit
   return signed ?? project;
 }
 
-export function useProject(slug: string) {
+export function useProject(slug: string, initialData?: ProjectWithRelations | null) {
   return useQuery({
     queryKey: ["projects", "slug", slug],
     queryFn: () => fetchProjectBySlug(slug),
+    initialData: initialData ?? undefined,
+    staleTime: 60_000,
   });
 }
 

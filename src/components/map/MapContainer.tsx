@@ -1,4 +1,6 @@
-import { useState, useMemo, lazy, Suspense, useEffect } from "react";
+import { useState, useMemo, lazy, Suspense, useEffect, useCallback, useRef } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { toast } from "sonner";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Globe2,
@@ -14,7 +16,8 @@ import {
   LocateFixed,
 } from "lucide-react";
 import type mapboxgl from "mapbox-gl";
-import { MapboxView, type LightPreset } from "./MapboxView";
+import { MapboxView } from "./MapboxView";
+import type { LightPreset, MapCameraState } from "./mapTypes";
 import { CloudLayer } from "./CloudLayer";
 import { CategoryPanel } from "./CategoryPanel";
 import { LayersMenu } from "./LayersMenu";
@@ -26,6 +29,10 @@ import { ProjectPopup } from "./ProjectPopup";
 const WaterDebugEditor = lazy(() =>
   import("./WaterDebugEditor").then((m) => ({ default: m.WaterDebugEditor })),
 );
+const CesiumView = lazy(async () => {
+  globalThis.CESIUM_BASE_URL = "/cesium/";
+  return import("./cesium/CesiumView");
+});
 import { shouldShowWaterDebugEditor } from "./waterDebugState";
 import { ROAD_GUIDE, setRouteHighlight } from "./roadsLayer";
 import { useMapConfig } from "@/hooks/use-map-config";
@@ -36,8 +43,23 @@ import { canAccessTenant } from "@/integrations/supabase/saas";
 import { useProjects, filterProjects } from "@/hooks/use-projects";
 import { usePois, usePoiRealtime } from "@/hooks/use-pois";
 import { useZones, useZonesRealtime } from "@/hooks/use-zones";
-import { DUBAI_CENTER, DEFAULT_ZOOM, EMIRATE_VIEWS, type EmirateKey, type EmirateView } from "@/lib/dubai";
+import {
+  DUBAI_CENTER,
+  DEFAULT_ZOOM,
+  EMIRATE_VIEWS,
+  type EmirateKey,
+  type EmirateView,
+} from "@/lib/dubai";
 import { CATEGORY_COLORS } from "@/lib/metro";
+import { safeHttpUrl } from "@/lib/utils";
+import { fetchPreferredPublishedProjectTour } from "@/features/virtual-tour/queries";
+import { requestMapboxLoad, releaseMapboxLoad } from "@/features/usage/client";
+import { readMapViewSession, saveMapViewSession } from "./mapViewSession";
+import type { ProjectWithRelations } from "@/lib/types";
+
+type TourLaunchTarget =
+  | { kind: "internal"; slug: string; tourId: string }
+  | { kind: "external"; url: string };
 
 const LIGHT_PRESETS: { value: LightPreset; label: string; Icon: typeof Sun }[] = [
   { value: "dawn", label: "Dawn", Icon: Sunrise },
@@ -59,10 +81,13 @@ const RAIL_GUIDE: { category: keyof typeof CATEGORY_COLORS; name: string; status
 ];
 
 export function MapContainer() {
+  const [mapSessionReady, setMapSessionReady] = useState(false);
+  const [restoredCamera, setRestoredCamera] = useState(false);
+  const navigate = useNavigate();
   const { data: cfg, isLoading: cfgLoading } = useMapConfig();
   const { data: projects = [] } = useProjects();
-  const { user } = useAuth();
-  const { tenants, loaded: tenantLoaded, load: loadTenants } = useTenantStore();
+  const { user, ready: authReady } = useAuth();
+  const { tenants, currentTenantId, loaded: tenantLoaded, load: loadTenants } = useTenantStore();
   useEffect(() => {
     if (user) void loadTenants();
   }, [user, loadTenants]);
@@ -83,26 +108,69 @@ export function MapContainer() {
     visibleProjectIds,
     zoneCategories,
   } = useFiltersStore();
+  // Mount on the first Satellite visit, then retain the exact instance across
+  // mode switches. Opening directly in 3D does not initialize a Mapbox map.
+  const [mapboxLoad, setMapboxLoad] = useState<{ instanceId: string; reservationId: string | null; tenantId: string | null } | null>(null);
+  const authenticatedUser = Boolean(user && !user.is_anonymous);
+  useEffect(() => {
+    if (!mapSessionReady || mapMode !== "satellite" || mapboxLoad || !cfg?.mapboxAccessToken || !authReady || (authenticatedUser && !tenantLoaded)) return;
+    let cancelled = false;
+    const instanceId = crypto.randomUUID();
+    const reservation = authenticatedUser
+      ? requestMapboxLoad(currentTenantId, instanceId)
+      : Promise.resolve({ allowed: true, reservationId: null });
+    void reservation.then(({ allowed, reservationId }) => {
+      if (cancelled) {
+        if (reservationId) void releaseMapboxLoad(reservationId);
+        return;
+      }
+      if (allowed) setMapboxLoad({ instanceId, reservationId, tenantId: currentTenantId });
+      else {
+        toast.error("Monthly Mapbox limit reached for this company. Opening 3D instead.");
+        setMapMode("3d");
+      }
+    }).catch(() => {
+      if (cancelled) return;
+      toast.error("Could not check the company Mapbox allowance. Opening 3D instead.");
+      setMapMode("3d");
+    });
+    return () => { cancelled = true; };
+  }, [mapSessionReady, mapMode, mapboxLoad, cfg?.mapboxAccessToken, authReady, authenticatedUser, user?.id, tenantLoaded, currentTenantId, setMapMode]);
   useEffect(() => {
     if (!canUseMetro && metroMode) setMetroMode(false);
   }, [canUseMetro, metroMode, setMetroMode]);
   const visibleMetroMode = canUseMetro && metroMode;
-  const { data: poisData = [] } = usePois(activeCategories);
-  // While browsing places, the map goes clean: projects, metro/train/roads and
-  // the (dark-dimming) zone spotlight all hide, leaving just the POI markers.
-  const browsingPois = activeCategories.size > 0;
-  // usePois is disabled + keepPreviousData when no category is active, so turning
-  // OFF the last category leaves its stale rows in `poisData`. Force empty here so
-  // the map actually clears the last category's markers.
-  const pois = browsingPois ? poisData : [];
-  usePoiRealtime();
-  const { data: zones = [] } = useZones();
-  useZonesRealtime();
-  const [camera, setCamera] = useState({
+  const [camera, setCamera] = useState<MapCameraState>({
     lat: DUBAI_CENTER.lat,
     lng: DUBAI_CENTER.lng,
     zoom: DEFAULT_ZOOM,
   });
+  useEffect(() => {
+    const saved = readMapViewSession();
+    if (saved) {
+      setCamera(saved.camera);
+      setMapMode(saved.mode);
+      setRestoredCamera(true);
+    }
+    setMapSessionReady(true);
+  }, [setMapMode]);
+  useEffect(() => {
+    if (mapSessionReady) saveMapViewSession({ camera, mode: mapMode });
+  }, [mapSessionReady, camera, mapMode]);
+  const { data: poisData = [], error: poisError } = usePois(activeCategories, camera);
+  // While browsing places, the map goes clean: projects, metro/train/roads and
+  // the (dark-dimming) zone spotlight all hide, leaving just the POI markers.
+  const browsingPois = activeCategories.size > 0;
+  useEffect(() => {
+    if (browsingPois && poisError) toast.error("Could not load places in this area. Try moving the map or retry later.");
+  }, [browsingPois, poisError]);
+  // usePois is disabled + keepPreviousData when no category is active, so turning
+  // OFF the last category leaves its stale rows in `poisData`. Force empty here so
+  // the map actually clears the last category's markers.
+  const pois = browsingPois && camera.zoom >= 8 ? poisData : [];
+  usePoiRealtime(browsingPois);
+  const { data: zones = [] } = useZones();
+  useZonesRealtime();
   const [transitioning, setTransitioning] = useState(false);
   // Guide panel is expanded on desktop, collapsible on mobile (starts collapsed
   // under md via the `hidden md:block` body + this toggle for the mobile chevron).
@@ -118,6 +186,11 @@ export function MapContainer() {
   // Camera destination selected by the emirate menu or the Dubai recenter button.
   const [emirateTarget, setEmirateTarget] = useState<EmirateView | null>(null);
   const [selectedEmirate, setSelectedEmirate] = useState<EmirateKey>("dubai");
+  const [tourLaunchingProjectId, setTourLaunchingProjectId] = useState<string | null>(null);
+  const [cinematicProjectId, setCinematicProjectId] = useState<string | null>(null);
+  const launchRequestRef = useRef(0);
+  const launchingProjectRef = useRef<string | null>(null);
+  const pendingTourRef = useRef<{ projectId: string; target: TourLaunchTarget } | null>(null);
 
   const goToEmirate = (view: EmirateView) => {
     setSelectedEmirate(view.key);
@@ -138,22 +211,77 @@ export function MapContainer() {
     projects.find((p) => p.id === selectedProjectId) ??
     null;
 
-  // Only the map(s) the user has actually visited get mounted. On first load
-  // that's a single Mapbox GL context (half the GPU/memory of mounting both);
-  // switching modes mounts the other one lazily and then keeps it alive, so
-  // re-switching stays instant with no expensive map re-creation.
-  const [mountedModes, setMountedModes] = useState<Set<"satellite" | "3d">>(
-    () => new Set([mapMode]),
-  );
-
-  const switchMode = (mode: "satellite" | "3d") => {
+  const switchMode = useCallback((mode: "satellite" | "3d") => {
     if (mode === mapMode) return;
-    setMountedModes((prev) => (prev.has(mode) ? prev : new Set(prev).add(mode)));
     setTransitioning(true);
     setMapReady(false); // Show loading overlay while new map loads
     setMapMode(mode);
     setTimeout(() => setTransitioning(false), 1200);
-  };
+  }, [mapMode, setMapMode]);
+
+  const enterTour = useCallback((target: TourLaunchTarget) => {
+    setTourLaunchingProjectId(null);
+    setCinematicProjectId(null);
+    launchingProjectRef.current = null;
+    pendingTourRef.current = null;
+    if (target.kind === "external") {
+      window.location.assign(target.url);
+      return;
+    }
+    void navigate({
+      to: "/projects/$slug/tour/$tourId",
+      params: { slug: target.slug, tourId: target.tourId },
+    });
+  }, [navigate]);
+
+  const finishProjectCinematic = useCallback((projectId: string) => {
+    const pending = pendingTourRef.current;
+    if (!pending || pending.projectId !== projectId) return;
+    enterTour(pending.target);
+  }, [enterTour]);
+
+  const launchProjectTour = useCallback(async (projectId: string) => {
+    if (launchingProjectRef.current === projectId) return;
+    const project = projects.find((item) => item.id === projectId);
+    if (!project) return;
+
+    const requestId = ++launchRequestRef.current;
+    launchingProjectRef.current = project.id;
+    setSelectedProjectId(project.id);
+    setTourLaunchingProjectId(project.id);
+
+    try {
+      const tour = await fetchPreferredPublishedProjectTour(project.id);
+      if (launchRequestRef.current !== requestId) return;
+      const legacyUrl = safeHttpUrl(project.tour_360_url);
+      const target: TourLaunchTarget | null = tour
+        ? { kind: "internal", slug: project.slug, tourId: tour.id }
+        : legacyUrl
+          ? { kind: "external", url: legacyUrl }
+          : null;
+
+      if (!target) {
+        launchingProjectRef.current = null;
+        setTourLaunchingProjectId(null);
+        toast.info("لا توجد جولة منشورة لهذا المشروع حتى الآن.");
+        return;
+      }
+
+      if (hasProject3d(project)) {
+        pendingTourRef.current = { projectId: project.id, target };
+        setCinematicProjectId(project.id);
+        switchMode("3d");
+        return;
+      }
+
+      enterTour(target);
+    } catch {
+      if (launchRequestRef.current !== requestId) return;
+      launchingProjectRef.current = null;
+      setTourLaunchingProjectId(null);
+      toast.error("تعذر تجهيز الجولة. حاول مرة أخرى.");
+    }
+  }, [enterTour, projects, setSelectedProjectId, switchMode]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-background">
@@ -166,14 +294,11 @@ export function MapContainer() {
       {cfg && (
         <>
           {/* Flat Mapbox satellite view (satellite-streets) with metro/train + water overlay */}
-          {mountedModes.has("satellite") && (
-            <div
-              className={
-                mapMode === "satellite"
-                  ? "absolute inset-0"
-                  : "absolute inset-0 opacity-0 pointer-events-none"
-              }
-            >
+          {mapboxLoad && <div
+            className="absolute inset-0"
+            style={{ visibility: mapMode === "satellite" ? "visible" : "hidden", pointerEvents: mapMode === "satellite" ? "auto" : "none" }}
+            aria-hidden={mapMode !== "satellite"}
+          >
               <MapboxView
                 accessToken={cfg.mapboxAccessToken}
                 projects={projectsToShow}
@@ -183,29 +308,36 @@ export function MapContainer() {
                 zones={zones}
                 zoneCategories={zoneCategories}
                 camera={camera}
+                skipOpeningFit={restoredCamera}
                 onCameraChange={setCamera}
                 onReady={() => mapMode === "satellite" && setMapReady(true)}
+                onMapReady={waterEditorEnabled ? setEditorMap : undefined}
+                onProjectDoubleClick={(projectId) => void launchProjectTour(projectId)}
                 active={mapMode === "satellite"}
                 metroMode={visibleMetroMode}
                 trainMode={trainMode}
                 roadsMode={roadsMode}
                 lightPreset={lightPreset}
                 mode="satellite"
+                tenantId={mapboxLoad.tenantId}
+                mapInstanceId={mapboxLoad.instanceId}
+                reservationId={mapboxLoad.reservationId}
               />
-            </div>
-          )}
+          </div>}
 
-          {/* 3D Mapbox view (Standard style, buildings, animated water/boats/clouds) */}
-          {mountedModes.has("3d") && (
-            <div
-              className={
-                mapMode === "3d"
-                  ? "absolute inset-0"
-                  : "absolute inset-0 opacity-0 pointer-events-none"
-              }
-            >
-              <MapboxView
-                accessToken={cfg.mapboxAccessToken}
+          {/* Keep the original Mapbox canvas and its camera while Cesium is active. */}
+          {mapSessionReady && mapMode === "3d" && (
+            <div className="absolute inset-0">
+              <Suspense
+                fallback={
+                  <div className="grid h-full place-items-center bg-[#d8cbb3]">
+                    <Loader2 className="h-7 w-7 animate-spin text-gold" />
+                  </div>
+                }
+              >
+              <CesiumView
+                ionToken={import.meta.env.VITE_CESIUM_ION_TOKEN}
+                tenantId={currentTenantId}
                 projects={projectsToShow}
                 pois={pois}
                 flyToTarget={emirateTarget}
@@ -215,28 +347,30 @@ export function MapContainer() {
                 camera={camera}
                 onCameraChange={setCamera}
                 onReady={() => mapMode === "3d" && setMapReady(true)}
-                onMapReady={waterEditorEnabled ? setEditorMap : undefined}
+                onProjectDoubleClick={(projectId) => void launchProjectTour(projectId)}
+                cinematicProjectId={cinematicProjectId}
+                onCinematicComplete={finishProjectCinematic}
                 active={mapMode === "3d"}
                 metroMode={visibleMetroMode}
                 trainMode={trainMode}
                 roadsMode={roadsMode}
                 lightPreset={lightPreset}
-                mode="3d"
               />
+              </Suspense>
             </div>
           )}
         </>
       )}
 
       {/* Premium aerial cloud layer — fades out as you zoom into the city (both modes) */}
-      <CloudLayer zoom={camera.zoom} />
+      {mapMode === "satellite" && <CloudLayer zoom={camera.zoom} />}
 
       {/* Places (tourism / education / hospitals) toggle buttons — tap a category
           to show its markers on the map (drives activeCategories → usePois). */}
       <CategoryPanel />
 
       {/* Dev-only Water Debug Editor (3D mode) — never mounted in production. */}
-      {waterEditorEnabled && mapMode === "3d" && (
+      {waterEditorEnabled && mapMode === "satellite" && (
         <Suspense fallback={null}>
           <WaterDebugEditor map={editorMap} />
         </Suspense>
@@ -280,7 +414,7 @@ export function MapContainer() {
         <EmiratesMenu activeKey={selectedEmirate} onSelect={goToEmirate} />
         <LayersMenu
           canUseMetro={canUseMetro}
-          showWaterEditor={import.meta.env.DEV}
+          showWaterEditor={import.meta.env.DEV && mapMode === "satellite"}
           waterEditor={waterEditorEnabled}
           onToggleWaterEditor={() => setWaterEditorEnabled((on) => !on)}
         />
@@ -294,7 +428,7 @@ export function MapContainer() {
         </button>
       </div>
 
-      {/* Light preset switcher — Mapbox Standard's built-in day/dawn/dusk/night */}
+      {/* Light preset switcher — drives Cesium sun/scene lighting. */}
       {mapMode === "3d" && (
         <div className="pointer-events-auto glass gold-hairline absolute right-4 top-16 z-20 flex gap-1 rounded-full p-1">
           {LIGHT_PRESETS.map(({ value, label, Icon }) => (
@@ -350,8 +484,8 @@ export function MapContainer() {
                       initial={{ opacity: 0, x: -8 }}
                       animate={{ opacity: 1, x: 0 }}
                       transition={{ delay: 0.15 + i * 0.06, duration: 0.3, ease: "easeOut" }}
-                      onPointerEnter={() => setRouteHighlight(r.key, true)}
-                      onPointerLeave={() => setRouteHighlight(r.key, false)}
+                      onPointerEnter={() => mapMode === "satellite" && setRouteHighlight(r.key, true)}
+                      onPointerLeave={() => mapMode === "satellite" && setRouteHighlight(r.key, false)}
                       className="flex cursor-pointer items-center gap-2 rounded-lg px-1.5 py-1 text-xs text-cream/90 transition-colors hover:bg-white/10"
                     >
                       <span
@@ -475,7 +609,46 @@ export function MapContainer() {
         )}
       </AnimatePresence>
 
-      <ProjectPopup project={selected} onClose={() => setSelectedProjectId(null)} />
+      <AnimatePresence>
+        {tourLaunchingProjectId && (
+          <motion.div
+            initial={{ opacity: 0, y: 14 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 14 }}
+            className="pointer-events-auto absolute bottom-6 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-2xl border border-gold/35 bg-slate-950/90 px-4 py-3 text-cream shadow-2xl backdrop-blur-md"
+            role="status"
+            aria-live="polite"
+          >
+            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-gold" />
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-gold">
+                {cinematicProjectId ? "3D preview" : "Preparing tour"}
+              </div>
+              <div className="truncate text-sm font-medium">
+                {projects.find((project) => project.id === tourLaunchingProjectId)?.name}
+              </div>
+            </div>
+            {cinematicProjectId && (
+              <button
+                type="button"
+                onClick={() => finishProjectCinematic(cinematicProjectId)}
+                className="ml-2 rounded-lg bg-gold px-3 py-2 text-xs font-semibold text-gold-foreground hover:bg-gold/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              >
+                Enter 360° now
+              </button>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <ProjectPopup
+        project={cinematicProjectId ? null : selected}
+        onClose={() => setSelectedProjectId(null)}
+      />
     </div>
   );
+}
+
+function hasProject3d(project: ProjectWithRelations) {
+  return Boolean(project.model_3d_enabled && safeHttpUrl(project.model_3d_url));
 }

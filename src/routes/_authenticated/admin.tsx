@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState, lazy, Suspense } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Plus, Trash2, Star, StarOff, Edit3, Upload, ImagePlus, X, Globe, Shield, Ban, ArrowUp, ArrowDown, Copy, Check } from "lucide-react";
+import { Activity, ArrowLeft, Plus, Trash2, Star, StarOff, Edit3, Upload, ImagePlus, X, Globe, Shield, Ban, ArrowUp, ArrowDown, Copy, Check } from "lucide-react";
 import { AppNavbar } from "@/components/layout/AppNavbar";
 import { AdminLocationPicker } from "@/components/map/AdminLocationPicker";
 import { ProjectPlotEditor } from "@/components/map/ProjectPlotEditor";
@@ -11,12 +11,15 @@ import type { Json } from "@/integrations/supabase/types";
 const AdminZoneEditor = lazy(() =>
   import("@/components/map/AdminZoneEditor").then((m) => ({ default: m.AdminZoneEditor })),
 );
+const CesiumProjectPlacementEditor = lazy(async () => {
+  globalThis.CESIUM_BASE_URL = "/cesium/";
+  return import("@/components/map/cesium/CesiumProjectPlacementEditor");
+});
 import { useAuth, useIsAdmin } from "@/hooks/use-auth";
 import { useMapConfig } from "@/hooks/use-map-config";
 import { useProjects, useProjectById, useCommunities, useDevelopers } from "@/hooks/use-projects";
 import { useTenantStore } from "@/store/tenant";
-import { fetchPlatformTenants, setTenantSuspended, isActiveStatus, fetchPlatformUsers, deletePlatformUser, type PlatformTenant, type PlatformUser } from "@/integrations/supabase/saas";
-import { POI_TABLES, type PoiCategory, type PoiPoint } from "@/hooks/use-pois";
+import { fetchPlatformTenants } from "@/integrations/supabase/saas";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,18 +29,23 @@ import { toast } from "sonner";
 import { formatAed, CATEGORIES } from "@/lib/dubai";
 import { mediaSrc } from "@/lib/media";
 import { safeHttpUrl } from "@/lib/utils";
-import { parseLatLngFromGoogleMapsUrl } from "@/lib/googleMapsLink";
-import { setUserBlocked } from "@/lib/user-security.functions";
-import { optimizeProjectImage, thumbnailPathFromStoragePath } from "@/lib/image-optimization";
-import { formatSubscriptionPeriod } from "@/lib/subscription-period";
+import { AdminField as Field, LocationFromLink } from "@/components/admin/AdminFormFields";
+import { formatImageBytes, imageContentHash, optimizeProjectImage, thumbnailPathFromStoragePath } from "@/lib/image-optimization";
 import type { ProjectFeeRow, ProjectPaymentPlanInstallmentRow, ProjectPaymentPlanRow, ProjectUnitTypeImageRow, ProjectUnitTypeRow } from "@/lib/types";
 import { lowestUnitPrice } from "@/lib/unit-types";
 import { legacyPaymentPlanValue } from "@/lib/payment-plans";
 import { validatePaymentPlanTotal } from "@/lib/offer-calculations";
 import { DEFAULT_OFFER_ACCENT_COLOR, DEFAULT_OFFER_PRIMARY_COLOR } from "@/lib/offer-branding";
+import { UnitGallery } from "@/components/units/UnitGallery";
+import { UnitOfferDialog } from "@/components/offers/UnitOfferDialog";
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import type { ProjectWithRelations } from "@/lib/types";
+import { ProjectVideoUpload } from "@/components/admin/ProjectVideoUpload";
+import { ProjectModelUpload } from "@/components/admin/ProjectModelUpload";
+import { isLimitedAuditViewer, isPlatformOwner } from "@/lib/platform-owner";
 
 const PROJECT_MEDIA_BUCKET = "project-media";
-const MAX_PROJECT_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_PROJECT_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_PROJECT_IMAGES = 12;
 const IMAGE_EXTENSIONS: Record<string, string> = {
   "image/jpeg": "jpg",
@@ -47,13 +55,66 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 };
 
 const UNIT_TYPE_QUICK_PICKS = ["Studio", "1BHK", "2BHK", "3BHK", "4BHK"];
+
+function DraftUnitPreview({ project, unit, plans, fees, onClose }: { project: ProjectWithRelations; unit: UnitTypeDraft; plans: PaymentPlanDraft[]; fees: FeeDraft[]; onClose: () => void }) {
+  const [uploads, setUploads] = useState<Array<{ key: string; url: string }>>([]);
+  const [offerOpen, setOfferOpen] = useState(false);
+  useEffect(() => {
+    const next = unit.imageFiles.map(image => ({ key: image.key, url: URL.createObjectURL(image.file) }));
+    setUploads(next);
+    return () => next.forEach(image => URL.revokeObjectURL(image.url));
+  }, [unit.imageFiles]);
+  const draft = useMemo<ProjectWithRelations>(() => {
+    const stamps = { tenant_id: project.unit_types[0]?.tenant_id ?? "", created_at: project.created_at, updated_at: project.updated_at };
+    const unitId = unit.id ?? "draft-unit";
+    const images = [
+      ...unit.images.map(image => ({ ...image, is_floor_plan: image.id === unit.floorPlanImageKey })),
+      ...uploads.map((image, index) => ({ ...stamps, id: image.key, project_id: project.id, unit_type_id: unitId, url: image.url, src: image.url, content_hash: null, sort_order: unit.images.length + index, is_floor_plan: image.key === unit.floorPlanImageKey })),
+    ];
+    const floor = images.find(image => image.is_floor_plan);
+    return {
+      ...project,
+      unit_types: [{ ...stamps, ...unit, id: unitId, project_id: project.id, images, floor_plan_src: floor?.src ?? floor?.url ?? unit.floor_plan_src, floor_plan_url: floor?.url ?? unit.floor_plan_url }],
+      payment_plans: plans.map((plan, index) => ({ ...stamps, ...plan, id: plan.id ?? `draft-plan-${index}`, project_id: project.id, installments: plan.installments.map((row, rowIndex) => ({ ...stamps, ...row, id: row.id ?? `draft-row-${index}-${rowIndex}`, payment_plan_id: plan.id ?? `draft-plan-${index}` })) })),
+      fees: fees.map((fee, index) => ({ ...stamps, ...fee, id: fee.id ?? `draft-fee-${index}`, project_id: project.id })),
+    };
+  }, [project, unit, plans, fees, uploads]);
+  return <Dialog open onOpenChange={open => { if (!open) onClose(); }}><DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto">
+    <DialogTitle>{unit.label || "Untitled unit"} — Draft preview</DialogTitle>
+    <DialogDescription>Unit, images and payment plan edits shown here have not been saved.</DialogDescription>
+    <p className="text-gold">{formatAed(unit.price_aed)} · {unit.area_sqm_min ?? unit.area_sqm_max ?? "—"} m² · {unit.availability}</p>
+    <UnitGallery unit={draft.unit_types[0]} projectName={project.name} />
+    <Button type="button" disabled={unit.availability === "sold"} onClick={() => setOfferOpen(true)}>Preview draft PDF</Button>
+    <UnitOfferDialog project={draft} initialUnitId={draft.unit_types[0].id} lockUnitSelection previewOnly open={offerOpen} onOpenChange={setOfferOpen} />
+  </DialogContent></Dialog>;
+}
+
 type UnitTypeDraft = Omit<ProjectUnitTypeRow, "id" | "project_id" | "tenant_id" | "created_at" | "updated_at"> & {
   id?: string;
   floor_plan_src?: string | null;
   images: Array<ProjectUnitTypeImageRow & { src?: string; thumb_src?: string }>;
-  imageFiles: Array<{ key: string; file: File }>;
+  imageFiles: PreparedImageUpload[];
   floorPlanImageKey: string | null;
 };
+
+type PreparedImageUpload = {
+  key: string;
+  file: File;
+  thumbnail: File | null;
+  contentHash: string;
+  originalSize: number;
+};
+
+async function prepareImageUpload(file: File, key: string): Promise<PreparedImageUpload> {
+  const optimized = await optimizeProjectImage(file);
+  return {
+    key,
+    file: optimized.full,
+    thumbnail: optimized.thumbnail,
+    contentHash: await imageContentHash(optimized.full),
+    originalSize: file.size,
+  };
+}
 
 function unitTypeDraft(row: ProjectUnitTypeRow): UnitTypeDraft {
   const source = row as ProjectUnitTypeRow & {
@@ -63,6 +124,11 @@ function unitTypeDraft(row: ProjectUnitTypeRow): UnitTypeDraft {
   return {
     id: row.id,
     label: row.label,
+    availability: row.availability ?? "available",
+    bedrooms: row.bedrooms ?? null,
+    bathrooms: row.bathrooms ?? null,
+    building_id: row.building_id ?? null,
+    view_description: row.view_description ?? null,
     price_aed: row.price_aed,
     area_sqm_min: row.area_sqm_min,
     area_sqm_max: row.area_sqm_max,
@@ -126,7 +192,7 @@ function feeDraft(row: ProjectFeeRow): FeeDraft {
 
 function imageFileError(file: File): string | null {
   if (!IMAGE_EXTENSIONS[file.type]) return `${file.name}: only JPEG, PNG, WebP, and AVIF images are allowed`;
-  if (file.size > MAX_PROJECT_IMAGE_BYTES) return `${file.name}: image must be 10 MB or smaller`;
+  if (file.size > MAX_PROJECT_IMAGE_BYTES) return `${file.name}: image must be 8 MB or smaller`;
   return null;
 }
 
@@ -225,7 +291,12 @@ function AdminPage() {
         <div id="admin-projects" className="mt-4 flex items-center justify-between scroll-mt-24">
           <h1 className="font-display text-4xl text-cream">Admin <span className="text-gold-gradient">Dashboard</span></h1>
           <div className="flex items-center gap-2">
-            {isPlatformAdmin && (
+            {isPlatformAdmin && isLimitedAuditViewer(user) && (
+              <Button asChild variant="outline" className="glass gold-hairline text-cream">
+                <Link to="/admin/activity-log"><Activity className="mr-1 h-4 w-4" /> Activity log</Link>
+              </Button>
+            )}
+            {isPlatformAdmin && isPlatformOwner(user) && (
               <Button asChild variant="outline" className="glass gold-hairline text-cream">
                 <Link to="/admin/platform"><Shield className="mr-1 h-4 w-4" /> Platform</Link>
               </Button>
@@ -264,6 +335,11 @@ function AdminPage() {
                   <Edit3 className="h-4 w-4 text-cream" />
                 </Link>
               </Button>
+              {p.tenant_id === currentTenantId && (
+                <Button asChild size="sm" variant="outline">
+                  <Link to="/admin/projects/$id/tours" params={{ id: p.id }}>Tours</Link>
+                </Button>
+              )}
               <Button size="icon" variant="ghost" onClick={() => del(p.id)}>
                 <Trash2 className="h-4 w-4 text-destructive" />
               </Button>
@@ -316,147 +392,6 @@ function AdminNav() {
           >
             {s.label}
           </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const POI_CATEGORIES = Object.keys(POI_TABLES) as PoiCategory[];
-
-// Add / list / delete Places of Interest (tourism, schools, hospitals). Mirrors
-// DeveloperManager, but the active POI table is chosen with a category tab and
-// the location is set with the same map picker used for projects.
-export function PoiManager() {
-  const { data: cfg } = useMapConfig();
-  const [category, setCategory] = useState<PoiCategory>("tourism");
-  const [rows, setRows] = useState<PoiPoint[]>([]);
-  const [loading, setLoading] = useState(false);
-  const empty = { name: "", lat: 25.1972, lng: 55.2744, images: "" };
-  const [form, setForm] = useState(empty);
-  const [saving, setSaving] = useState(false);
-
-  const table = POI_TABLES[category].table;
-
-  const load = async (cat: PoiCategory) => {
-    setLoading(true);
-    const { data, error } = await supabase
-      .from(POI_TABLES[cat].table)
-      .select("*")
-      .order("created_at", { ascending: false });
-    setLoading(false);
-    if (error) return toast.error(errMsg(error, "Could not load places"));
-    setRows((data ?? []) as PoiPoint[]);
-  };
-
-  useEffect(() => {
-    void load(category);
-    setForm(empty);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [category]);
-
-  const save = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!form.name.trim()) return toast.error("Name is required");
-    setSaving(true);
-    try {
-      const payload = {
-        name: form.name.trim(),
-        lat: Number(form.lat),
-        lng: Number(form.lng),
-        images: form.images
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
-      };
-      const { error } = await supabase.from(table).insert(payload);
-      if (error) throw error;
-      toast.success(`${POI_TABLES[category].label} place added`);
-      setForm(empty);
-      void load(category);
-    } catch (err) {
-      toast.error(errMsg(err));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const del = async (row: PoiPoint) => {
-    if (!confirm(`Delete "${row.name}"?`)) return;
-    const { error } = await supabase.from(table).delete().eq("id", row.id);
-    if (error) return toast.error(errMsg(error, "Delete failed"));
-    toast.success("Place deleted");
-    void load(category);
-  };
-
-  return (
-    <div id="admin-poi" className="mt-10 scroll-mt-24">
-      <h2 className="font-display text-3xl text-cream">Places of interest</h2>
-
-      {/* Category tabs */}
-      <div className="mt-3 flex flex-wrap gap-2">
-        {POI_CATEGORIES.map((c) => (
-          <button
-            key={c}
-            type="button"
-            onClick={() => setCategory(c)}
-            className={`rounded-full px-4 py-1.5 text-sm transition-all ${
-              category === c ? "bg-gold text-gold-foreground shadow" : "glass gold-hairline text-cream hover:text-gold"
-            }`}
-          >
-            {POI_TABLES[c].icon} {POI_TABLES[c].label}
-          </button>
-        ))}
-      </div>
-
-      <form onSubmit={save} className="glass-strong gold-hairline mt-4 grid gap-3 rounded-2xl p-5 sm:grid-cols-2">
-        <Field label="Name"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /></Field>
-        <Field label="Image URLs (comma-separated)"><Input value={form.images} onChange={(e) => setForm({ ...form, images: e.target.value })} placeholder="https://…, https://…" /></Field>
-        {cfg?.mapboxAccessToken && (
-          <div className="sm:col-span-2">
-            <Label className="text-xs uppercase tracking-widest text-muted-foreground">Location on map</Label>
-            <div className="mt-1">
-              <AdminLocationPicker
-                accessToken={cfg.mapboxAccessToken}
-                lat={form.lat}
-                lng={form.lng}
-                onChange={({ lat, lng }) => setForm({ ...form, lat, lng })}
-              />
-            </div>
-          </div>
-        )}
-        <div className="sm:col-span-2">
-          <Field label="Google Maps link (auto-fills location)">
-            <LocationFromLink onCoords={({ lat, lng }) => setForm({ ...form, lat, lng })} />
-          </Field>
-        </div>
-        <Field label="Latitude"><Input type="number" step="0.0001" value={form.lat} onChange={(e) => setForm({ ...form, lat: Number(e.target.value) })} required /></Field>
-        <Field label="Longitude"><Input type="number" step="0.0001" value={form.lng} onChange={(e) => setForm({ ...form, lng: Number(e.target.value) })} required /></Field>
-        <div className="flex gap-2 sm:col-span-2">
-          <Button type="submit" disabled={saving} className="bg-gold text-gold-foreground hover:bg-gold/90">
-            <Plus className="mr-1 h-4 w-4" /> {saving ? "Saving…" : `Add ${POI_TABLES[category].label} place`}
-          </Button>
-        </div>
-      </form>
-
-      <div className="mt-4 grid gap-2">
-        {loading && <div className="p-4 text-center text-sm text-muted-foreground">Loading…</div>}
-        {!loading && rows.length === 0 && (
-          <div className="glass gold-hairline rounded-2xl p-4 text-center text-sm text-muted-foreground">
-            No {POI_TABLES[category].label.toLowerCase()} places yet.
-          </div>
-        )}
-        {rows.map((row) => (
-          <div key={row.id} className="glass gold-hairline flex items-center gap-3 rounded-2xl p-3">
-            <div className="grid h-10 w-10 place-items-center rounded-md bg-black/30 text-lg" style={{ color: POI_TABLES[category].color }}>
-              {POI_TABLES[category].icon}
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="truncate font-display text-lg text-cream">{row.name}</div>
-              <div className="truncate text-xs text-muted-foreground">{row.lat.toFixed(4)}, {row.lng.toFixed(4)}</div>
-            </div>
-            <Button size="icon" variant="ghost" onClick={() => del(row)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
-          </div>
         ))}
       </div>
     </div>
@@ -730,13 +665,36 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
     featured: existing?.featured ?? false,
     plot_geometry: (existing?.plot_geometry as GeoJSON.Polygon | null) ?? null,
     plot_color: existing?.plot_color ?? "#c9a84c",
+    model_3d_url: existing?.model_3d_url ?? "",
+    model_3d_enabled: existing?.model_3d_enabled ?? false,
+    model_3d_lat: existing?.model_3d_lat ?? null,
+    model_3d_lng: existing?.model_3d_lng ?? null,
+    model_3d_altitude: existing?.model_3d_altitude ?? 0,
+    model_3d_scale: existing?.model_3d_scale ?? 1,
+    model_3d_rotation: existing?.model_3d_rotation ?? 0,
   });
   const [gallery, setGallery] = useState(existing?.images ?? []);
   const [unitTypes, setUnitTypes] = useState<UnitTypeDraft[]>(() => (existing?.unit_types ?? []).map(unitTypeDraft));
+  const [unitSearch, setUnitSearch] = useState("");
+  const [unitStatusFilter, setUnitStatusFilter] = useState("");
+  const [unitMinPrice, setUnitMinPrice] = useState("");
+  const [unitMaxPrice, setUnitMaxPrice] = useState("");
+  const [previewUnitIndex, setPreviewUnitIndex] = useState<number | null>(null);
   const [paymentPlans, setPaymentPlans] = useState<PaymentPlanDraft[]>(() => (existing?.payment_plans ?? []).map(paymentPlanDraft));
   const [fees, setFees] = useState<FeeDraft[]>(() => (existing?.fees ?? []).map(feeDraft));
-  const [imageFiles, setImageFiles] = useState<File[]>([]);
+  const [imageFiles, setImageFiles] = useState<PreparedImageUpload[]>([]);
   const [saving, setSaving] = useState(false);
+  const [mapsAvailable, setMapsAvailable] = useState(false);
+  const [placementEditorOpen, setPlacementEditorOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      const canvas = document.createElement("canvas");
+      setMapsAvailable(Boolean(canvas.getContext("webgl2") || canvas.getContext("webgl")));
+    } catch {
+      setMapsAvailable(false);
+    }
+  }, []);
 
   // Child rows (unit types, images) must carry the tenant that owns the PROJECT,
   // not whichever org the switcher currently has selected. Stamping the selected
@@ -759,14 +717,21 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
   }, [existing?.id, existing?.images]);
 
   useEffect(() => {
-    if (!existing) return;
+    if (!existing?.id) return;
     setF((current) => ({
       ...current,
       offer_primary_color: existing.offer_primary_color ?? "",
       offer_accent_color: existing.offer_accent_color ?? "",
       offer_header_image_url: existing.offer_header_image_url ?? "",
+      model_3d_url: existing.model_3d_url ?? "",
+      model_3d_enabled: existing.model_3d_enabled ?? false,
+      model_3d_lat: existing.model_3d_lat ?? null,
+      model_3d_lng: existing.model_3d_lng ?? null,
+      model_3d_altitude: existing.model_3d_altitude ?? 0,
+      model_3d_scale: existing.model_3d_scale ?? 1,
+      model_3d_rotation: existing.model_3d_rotation ?? 0,
     }));
-  }, [existing?.id, existing?.offer_primary_color, existing?.offer_accent_color, existing?.offer_header_image_url]);
+  }, [existing?.id, existing?.offer_primary_color, existing?.offer_accent_color, existing?.offer_header_image_url, existing?.model_3d_url, existing?.model_3d_enabled, existing?.model_3d_lat, existing?.model_3d_lng, existing?.model_3d_altitude, existing?.model_3d_scale, existing?.model_3d_rotation]);
 
   useEffect(() => {
     setUnitTypes((existing?.unit_types ?? []).map(unitTypeDraft));
@@ -782,9 +747,9 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
 
   const imagePreviews = useMemo(
     () =>
-      imageFiles.map((file) => ({
-        file,
-        url: URL.createObjectURL(file),
+      imageFiles.map((upload) => ({
+        ...upload,
+        url: URL.createObjectURL(upload.file),
       })),
     [imageFiles],
   );
@@ -800,19 +765,19 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
     if (imageFiles.length > MAX_PROJECT_IMAGES) {
       throw new Error(`You can upload up to ${MAX_PROJECT_IMAGES} images at a time`);
     }
-    for (const file of imageFiles) {
-      const validationError = imageFileError(file);
-      if (validationError) throw new Error(validationError);
-      if (!(await hasAllowedImageSignature(file))) {
-        throw new Error(`${file.name}: file contents do not match its image type`);
-      }
-    }
+    const { data: hashRows, error: hashError } = await supabase.from("project_images")
+      .select("content_hash")
+      .eq("project_id", projectId)
+      .not("content_hash", "is", null);
+    if (hashError) throw hashError;
+    const existingHashes = new Set<string>((hashRows ?? []).map((row: { content_hash: string }) => row.content_hash));
+    const pending = imageFiles.filter((upload) => !existingHashes.has(upload.contentHash));
+    if (pending.length < imageFiles.length) toast.info(`${imageFiles.length - pending.length} duplicate image${imageFiles.length - pending.length === 1 ? " was" : "s were"} skipped`);
 
     const uploaded = await Promise.all(
-      imageFiles.map(async (file, index) => {
-        const optimized = await optimizeProjectImage(file);
-        const extension = IMAGE_EXTENSIONS[optimized.full.type] ?? (optimized.full.type === "image/jpeg" ? "jpg" : "webp");
-        const safeName = file.name
+      pending.map(async (upload, index) => {
+        const extension = IMAGE_EXTENSIONS[upload.file.type] ?? (upload.file.type === "image/jpeg" ? "jpg" : "webp");
+        const safeName = upload.file.name
           .replace(/\.[^/.]+$/, "")
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "-")
@@ -825,9 +790,9 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
 
         const { error: uploadError } = await supabase.storage
           .from(PROJECT_MEDIA_BUCKET)
-          .upload(path, optimized.full, {
+          .upload(path, upload.file, {
             cacheControl: "31536000",
-            contentType: optimized.full.type,
+            contentType: upload.file.type,
             upsert: false,
           });
 
@@ -835,35 +800,36 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
 
         // Keep a tiny, immutable object beside the original. Map/list views
         // resolve this derived path; old objects fall back to the full image.
-        if (optimized.thumbnail) {
+        if (upload.thumbnail) {
           const { error: thumbnailError } = await supabase.storage
             .from(PROJECT_MEDIA_BUCKET)
-            .upload(thumbnailPathFromStoragePath(path), optimized.thumbnail, {
+            .upload(thumbnailPathFromStoragePath(path), upload.thumbnail, {
               cacheControl: "31536000",
-              contentType: optimized.thumbnail.type,
+              contentType: upload.thumbnail.type,
               upsert: false,
             });
           if (thumbnailError) throw thumbnailError;
         }
 
         const { data } = supabase.storage.from(PROJECT_MEDIA_BUCKET).getPublicUrl(path);
-        return data.publicUrl;
+        return { url: data.publicUrl, content_hash: upload.contentHash };
       }),
     );
 
     const firstSort = gallery.length;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { error: imageError } = await (supabase.from("project_images").insert as any)(
-      uploaded.map((url, index) => ({
+      uploaded.map((image, index) => ({
         project_id: projectId,
         tenant_id: projectTenantId, // the project's own tenant, not the selected one
-        url,
+        url: image.url,
+        content_hash: image.content_hash,
         sort_order: firstSort + index,
       })),
     );
 
     if (imageError) throw imageError;
-    return uploaded;
+    return uploaded.map((image) => image.url);
   };
 
   const removeExistingImage = async (imageId: string, url: string) => {
@@ -891,6 +857,11 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
   const persistUnitTypes = async (projectId: string) => {
     const rows = unitTypes.map((item, index) => ({
       label: item.label.trim(),
+      availability: item.availability,
+      bedrooms: item.bedrooms,
+      bathrooms: item.bathrooms,
+      building_id: item.building_id,
+      view_description: item.view_description?.trim() || null,
       price_aed: item.price_aed,
       area_sqm_min: item.area_sqm_min,
       area_sqm_max: item.area_sqm_max,
@@ -955,9 +926,11 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         }));
       }
 
-      const uploaded = await Promise.all(item.imageFiles.map(async ({ key, file }, imageIndex) => {
-        const optimized = await optimizeProjectImage(file);
-        const extension = IMAGE_EXTENSIONS[optimized.full.type] ?? (optimized.full.type === "image/jpeg" ? "jpg" : "webp");
+      const existingHashes = new Set(oldImages.map((image) => (image as ProjectUnitTypeImageRow & { content_hash?: string | null }).content_hash).filter(Boolean));
+      const pendingImages = item.imageFiles.filter((image) => !existingHashes.has(image.contentHash));
+      if (pendingImages.length < item.imageFiles.length) toast.info(`${item.imageFiles.length - pendingImages.length} duplicate unit image${item.imageFiles.length - pendingImages.length === 1 ? " was" : "s were"} skipped`);
+      const uploaded = await Promise.all(pendingImages.map(async ({ key, file, thumbnail, contentHash }, imageIndex) => {
+        const extension = IMAGE_EXTENSIONS[file.type] ?? (file.type === "image/jpeg" ? "jpg" : "webp");
         const safeName = file.name
           .replace(/\.[^/.]+$/, "")
           .toLowerCase()
@@ -967,28 +940,28 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         const path = `${projectTenantId}/${projectId}/unit-types/${unitTypeId}/${Date.now()}-${imageIndex}-${safeName || "unit-image"}.${extension}`;
         const { error: uploadError } = await supabase.storage
           .from(PROJECT_MEDIA_BUCKET)
-          .upload(path, optimized.full, {
+          .upload(path, file, {
             cacheControl: "31536000",
-            contentType: optimized.full.type,
+            contentType: file.type,
             upsert: false,
           });
         if (uploadError) throw uploadError;
-        if (optimized.thumbnail) {
+        if (thumbnail) {
           const { error: thumbnailError } = await supabase.storage
             .from(PROJECT_MEDIA_BUCKET)
-            .upload(thumbnailPathFromStoragePath(path), optimized.thumbnail, {
+            .upload(thumbnailPathFromStoragePath(path), thumbnail, {
               cacheControl: "31536000",
-              contentType: optimized.thumbnail.type,
+              contentType: thumbnail.type,
               upsert: false,
             });
           if (thumbnailError) throw thumbnailError;
         }
         const { data } = supabase.storage.from(PROJECT_MEDIA_BUCKET).getPublicUrl(path);
-        return { key, url: data.publicUrl };
+        return { key, url: data.publicUrl, content_hash: contentHash };
       }));
 
-      const existingEntries: Array<{ key: string; id?: string; url: string }> = item.images.map((image) => ({ key: image.id, id: image.id, url: image.url }));
-      const allImages: Array<{ key: string; id?: string; url: string }> = [...existingEntries, ...uploaded];
+      const existingEntries: Array<{ key: string; id?: string; url: string; content_hash?: string }> = item.images.map((image) => ({ key: image.id, id: image.id, url: image.url, content_hash: (image as ProjectUnitTypeImageRow & { content_hash?: string }).content_hash }));
+      const allImages: Array<{ key: string; id?: string; url: string; content_hash?: string }> = [...existingEntries, ...uploaded];
       const selected = allImages.find((image) => image.key === item.floorPlanImageKey);
       const selectedUrl = selected?.url ?? item.floor_plan_url?.trim() ?? null;
 
@@ -1018,6 +991,7 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
             url: image.url,
             sort_order: imageIndex,
             is_floor_plan: image.key === item.floorPlanImageKey,
+            content_hash: image.content_hash ?? null,
           });
           if (error) throw error;
         }
@@ -1171,6 +1145,10 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         toast.error(`Unit type ${index + 1}: label is required`);
         return;
       }
+      if ([item.bedrooms, item.bathrooms].some(value => value != null && (!Number.isInteger(value) || value < 0))) {
+        toast.error(`Unit type ${index + 1}: room counts must be non-negative whole numbers`);
+        return;
+      }
       if (item.price_aed != null && (!Number.isFinite(item.price_aed) || item.price_aed <= 0)) {
         toast.error(`Unit type ${index + 1}: price must be positive`);
         return;
@@ -1234,6 +1212,38 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         return;
       }
     }
+    if (f.model_3d_enabled && !f.model_3d_url.trim()) {
+      toast.error("Upload a GLB model or disable the interactive 3D model");
+      return;
+    }
+    if (f.model_3d_url && !/^https:\/\//i.test(f.model_3d_url)) {
+      toast.error("The 3D model URL must use HTTPS");
+      return;
+    }
+    if (!Number.isFinite(f.model_3d_scale) || f.model_3d_scale <= 0) {
+      toast.error("The 3D model scale must be greater than zero");
+      return;
+    }
+    if (f.model_3d_scale > 10000) {
+      toast.error("The 3D model scale must be 10,000 or smaller");
+      return;
+    }
+    if (!Number.isFinite(f.model_3d_altitude)) {
+      toast.error("The 3D model altitude is invalid");
+      return;
+    }
+    if (!Number.isFinite(f.model_3d_rotation) || Math.abs(f.model_3d_rotation) > 360) {
+      toast.error("The 3D model heading must be between -360 and 360 degrees");
+      return;
+    }
+    if (f.model_3d_lat != null && (!Number.isFinite(f.model_3d_lat) || Math.abs(f.model_3d_lat) > 90)) {
+      toast.error("The 3D model latitude is invalid");
+      return;
+    }
+    if (f.model_3d_lng != null && (!Number.isFinite(f.model_3d_lng) || Math.abs(f.model_3d_lng) > 180)) {
+      toast.error("The 3D model longitude is invalid");
+      return;
+    }
     setSaving(true);
     try {
       const isEditing = Boolean(id);
@@ -1249,6 +1259,10 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         brochure_url: f.brochure_url || null,
         video_url: f.video_url || null,
         tour_360_url: f.tour_360_url || null,
+        model_3d_url: f.model_3d_url || null,
+        model_3d_enabled: Boolean(f.model_3d_enabled && f.model_3d_url),
+        model_3d_lat: f.model_3d_lat,
+        model_3d_lng: f.model_3d_lng,
         tags: f.tags
           .split(",")
           .map((tag) => tag.trim())
@@ -1322,7 +1336,7 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
             {communities.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         </Field>
-        {cfg?.mapboxAccessToken && (
+        {!id && cfg?.mapboxAccessToken && mapsAvailable && (
           <div className="sm:col-span-2">
             <Label className="text-xs uppercase tracking-widest text-muted-foreground">Location on map</Label>
             <div className="mt-1">
@@ -1340,9 +1354,9 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
             <LocationFromLink onCoords={({ lat, lng }) => setF({ ...f, lat, lng })} />
           </Field>
         </div>
-        {cfg?.mapboxAccessToken && (
+        {cfg?.mapboxAccessToken && mapsAvailable && (
           <div className="sm:col-span-2">
-            <Field label="Plot boundary (optional — draw the land parcel)">
+            <Field label="Plot boundary (draw or edit the land parcel)">
               <div className="mb-2 flex items-center gap-2">
                 <span className="text-[11px] text-muted-foreground">Boundary colour:</span>
                 {PLOT_SWATCHES.map((c) => (
@@ -1453,7 +1467,103 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
           <p className="text-xs text-muted-foreground">These colours are used in the sales offer only. Leave them at default to keep the standard navy and gold identity.</p>
         </div>
         <Field label="Brochure URL"><Input value={f.brochure_url} onChange={(e) => setF({ ...f, brochure_url: e.target.value })} /></Field>
-        <Field label="Video URL"><Input value={f.video_url} onChange={(e) => setF({ ...f, video_url: e.target.value })} /></Field>
+        <ProjectVideoUpload
+          tenantId={projectTenantId}
+          value={f.video_url}
+          onChange={(videoUrl) => setF((current) => ({ ...current, video_url: videoUrl }))}
+          onError={(message) => toast.error(message)}
+        />
+        <div className="space-y-3 rounded-2xl border border-gold/25 bg-black/15 p-4 sm:col-span-2">
+          <ProjectModelUpload
+            tenantId={projectTenantId}
+            value={f.model_3d_url}
+            onChange={(modelUrl) => setF((current) => ({
+              ...current,
+              model_3d_url: modelUrl,
+              model_3d_enabled: Boolean(modelUrl),
+            }))}
+            onError={(message) => toast.error(message)}
+          />
+          <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
+            <input
+              type="checkbox"
+              checked={f.model_3d_enabled}
+              disabled={!f.model_3d_url}
+              onChange={(event) => setF((current) => ({ ...current, model_3d_enabled: event.target.checked }))}
+              className="mt-0.5 h-4 w-4 accent-[#c9a84c]"
+            />
+            <span>
+              <span className="block text-sm font-medium text-cream">Show the detailed model when this project is selected</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">The normal city map stays lightweight; only this project model is loaded on demand.</span>
+            </span>
+          </label>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <Field label="Model latitude (optional)">
+              <Input
+                type="number"
+                step="0.000001"
+                value={f.model_3d_lat ?? ""}
+                placeholder={String(f.lat)}
+                onChange={(event) => setF((current) => ({ ...current, model_3d_lat: event.target.value ? Number(event.target.value) : null }))}
+              />
+            </Field>
+            <Field label="Model longitude (optional)">
+              <Input
+                type="number"
+                step="0.000001"
+                value={f.model_3d_lng ?? ""}
+                placeholder={String(f.lng)}
+                onChange={(event) => setF((current) => ({ ...current, model_3d_lng: event.target.value ? Number(event.target.value) : null }))}
+              />
+            </Field>
+            <Field label="Altitude (metres)">
+              <Input type="number" step="0.1" value={f.model_3d_altitude} onChange={(event) => setF((current) => ({ ...current, model_3d_altitude: Number(event.target.value) }))} />
+            </Field>
+            <Field label="Scale">
+              <Input type="number" min="0.001" max="10000" step="0.01" value={f.model_3d_scale} onChange={(event) => setF((current) => ({ ...current, model_3d_scale: Number(event.target.value) }))} />
+            </Field>
+            <Field label="Heading (degrees)">
+              <Input type="number" min="-360" max="360" step="1" value={f.model_3d_rotation} onChange={(event) => setF((current) => ({ ...current, model_3d_rotation: Number(event.target.value) }))} />
+            </Field>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">Leave model latitude and longitude blank to use the project marker. GLB units should be metres; use scale and heading only for fine alignment.</p>
+            {f.model_3d_url && mapsAvailable && (
+              <Button type="button" variant="outline" className="glass gold-hairline" onClick={() => setPlacementEditorOpen((open) => !open)}>
+                {placementEditorOpen ? "Close visual editor" : "Open visual placement editor"}
+              </Button>
+            )}
+          </div>
+          {placementEditorOpen && f.model_3d_url && (
+            <Suspense fallback={<div className="grid h-40 place-items-center text-sm text-muted-foreground">Loading Cesium editor…</div>}>
+              <CesiumProjectPlacementEditor
+                modelUrl={f.model_3d_url}
+                plotGeometry={f.plot_geometry}
+                ionToken={import.meta.env.VITE_CESIUM_ION_TOKEN}
+                value={{
+                  latitude: f.model_3d_lat ?? f.lat,
+                  longitude: f.model_3d_lng ?? f.lng,
+                  altitude: f.model_3d_altitude,
+                  scale: f.model_3d_scale,
+                  heading: f.model_3d_rotation,
+                }}
+                onCancel={() => setPlacementEditorOpen(false)}
+                onSave={(placement) => {
+                  setF((current) => ({
+                    ...current,
+                    model_3d_lat: placement.latitude,
+                    model_3d_lng: placement.longitude,
+                    model_3d_altitude: placement.altitude,
+                    model_3d_scale: placement.scale,
+                    model_3d_rotation: placement.heading,
+                  }));
+                  setPlacementEditorOpen(false);
+                  toast.success("3D placement applied. Save the project to persist it.");
+                }}
+              />
+            </Suspense>
+          )}
+        </div>
         <Field label="360 tour URL"><Input value={f.tour_360_url} onChange={(e) => setF({ ...f, tour_360_url: e.target.value })} /></Field>
         <Field label="Tags"><Input value={f.tags} onChange={(e) => setF({ ...f, tags: e.target.value })} placeholder="waterfront, luxury, family" /></Field>
       </div>
@@ -1470,11 +1580,17 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
             className="glass gold-hairline text-cream"
             onClick={() => setUnitTypes((current) => [
               ...current,
-              { label: "", price_aed: null, area_sqm_min: null, area_sqm_max: null, floor: null, floor_plan_url: null, sort_order: current.length, images: [], imageFiles: [], floorPlanImageKey: null },
+              { label: "", availability: "available", bedrooms: null, bathrooms: null, building_id: null, view_description: null, price_aed: null, area_sqm_min: null, area_sqm_max: null, floor: null, floor_plan_url: null, sort_order: current.length, images: [], imageFiles: [], floorPlanImageKey: null },
             ])}
           >
             <Plus className="mr-1 h-4 w-4" /> Add unit type
           </Button>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-4">
+          <Input aria-label="Search units in this project" placeholder="Search units…" value={unitSearch} onChange={e => setUnitSearch(e.target.value)} />
+          <select aria-label="Filter unit availability" className="rounded-md border border-border bg-background p-2 text-sm" value={unitStatusFilter} onChange={e => setUnitStatusFilter(e.target.value)}><option value="">All statuses</option><option value="available">Available</option><option value="reserved">Reserved</option><option value="sold">Sold</option></select>
+          <Input aria-label="Minimum unit price" type="number" min="0" placeholder="Min AED" value={unitMinPrice} onChange={e => setUnitMinPrice(e.target.value)} />
+          <Input aria-label="Maximum unit price" type="number" min="0" placeholder="Max AED" value={unitMaxPrice} onChange={e => setUnitMaxPrice(e.target.value)} />
         </div>
         {unitTypes.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border/60 p-3 text-sm text-muted-foreground">
@@ -1482,7 +1598,7 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
           </div>
         ) : (
           <div className="space-y-2">
-            {unitTypes.map((item, index) => (
+            {unitTypes.map((item, index) => ({ item, index })).filter(({ item }) => item.label.toLowerCase().includes(unitSearch.trim().toLowerCase()) && (!unitStatusFilter || item.availability === unitStatusFilter) && (!unitMinPrice || (item.price_aed != null && item.price_aed >= Number(unitMinPrice))) && (!unitMaxPrice || (item.price_aed != null && item.price_aed <= Number(unitMaxPrice)))).map(({ item, index }) => (
               <div key={item.id ?? `new-unit-${index}`} className="grid gap-2 rounded-xl border border-border/60 bg-black/20 p-3 sm:grid-cols-[1.1fr_1fr_1fr_1fr_1fr_auto] sm:items-end">
                 <label className="space-y-1 text-xs text-muted-foreground">
                   <span>Type</span>
@@ -1551,6 +1667,17 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                   </Button>
                 </div>
                 <div className="space-y-2 sm:col-span-6">
+                  <div className="grid gap-2 sm:grid-cols-4">
+                    <label className="space-y-1 text-xs">Availability<select value={item.availability} className="block w-full rounded-md border border-border bg-background p-2" onChange={e => setUnitTypes(current => current.map((row, i) => i === index ? { ...row, availability: e.target.value } : row))}><option value="available">Available</option><option value="reserved">Reserved</option><option value="sold">Sold</option></select></label>
+                    <label className="space-y-1 text-xs">Bedrooms (0 = studio)<Input type="number" min="0" step="1" placeholder="Not specified" value={item.bedrooms ?? ""} onChange={e => setUnitTypes(current => current.map((row, i) => i === index ? { ...row, bedrooms: e.target.value === "" ? null : Number(e.target.value) } : row))} /></label>
+                    <label className="space-y-1 text-xs">Bathrooms<Input type="number" min="0" step="1" placeholder="Not specified" value={item.bathrooms ?? ""} onChange={e => setUnitTypes(current => current.map((row, i) => i === index ? { ...row, bathrooms: e.target.value === "" ? null : Number(e.target.value) } : row))} /></label>
+                    <label className="space-y-1 text-xs">View<Input placeholder="Sea / garden / city" value={item.view_description ?? ""} onChange={e => setUnitTypes(current => current.map((row, i) => i === index ? { ...row, view_description: e.target.value || null } : row))} /></label>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {existing && <Button type="button" size="sm" variant="outline" onClick={() => setPreviewUnitIndex(index)}>Preview unsaved changes</Button>}
+                    <Button type="button" size="sm" variant="outline" onClick={() => { setUnitSearch(""); setUnitStatusFilter(""); setUnitMinPrice(""); setUnitMaxPrice(""); setUnitTypes(current => [...current, { ...item, id: undefined, label: `${item.label} copy`, availability: "available", images: [], imageFiles: [], floor_plan_url: null, floor_plan_src: null, floorPlanImageKey: null, sort_order: current.length }]); toast.success("Unit details copied. Add photos for the new unit."); }}><Copy className="mr-1 h-4 w-4" /> Duplicate details</Button>
+                    {item.id && existing && <Button asChild size="sm" variant="outline"><Link to="/projects/$slug/units/$unitTypeId" params={{ slug: existing.slug, unitTypeId: item.id }} target="_blank">Preview saved unit & PDF</Link></Button>}
+                  </div>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <span className="block text-xs font-medium text-cream">Unit photos &amp; floor plan</span>
@@ -1577,10 +1704,13 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                                 return;
                               }
                             }
+                            const prepared = await Promise.all(files.map((file, fileIndex) => prepareImageUpload(file, keys[fileIndex])));
+                            const unique = prepared.filter((upload, uploadIndex) => prepared.findIndex((candidate) => candidate.contentHash === upload.contentHash) === uploadIndex);
+                            if (unique.length < prepared.length) toast.info(`${prepared.length - unique.length} duplicate image${prepared.length - unique.length === 1 ? " was" : "s were"} skipped`);
                             setUnitTypes((current) => current.map((row, rowIndex) => rowIndex === index ? {
                               ...row,
-                              imageFiles: [...row.imageFiles, ...files.map((file, fileIndex) => ({ key: keys[fileIndex], file }))],
-                              floorPlanImageKey: row.floorPlanImageKey ?? keys[0],
+                              imageFiles: [...row.imageFiles, ...unique.filter((upload) => !row.imageFiles.some((currentUpload) => currentUpload.contentHash === upload.contentHash))],
+                              floorPlanImageKey: row.floorPlanImageKey ?? unique[0]?.key ?? null,
                             } : row));
                           })();
                         }}
@@ -1589,10 +1719,12 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                   </div>
                   {(item.images.length > 0 || item.imageFiles.length > 0) && (
                     <div className="grid gap-2 sm:grid-cols-3">
-                      {item.images.map((image) => (
+                      {item.images.map((image, imageIndex) => (
                         <div key={image.id} className="overflow-hidden rounded-lg border border-border/50 bg-black/20">
                           <img src={mediaSrc(image.thumb_src, image.src ?? image.url)} alt="" className="aspect-video w-full object-cover" loading="lazy" />
                           <div className="flex items-center gap-2 p-2">
+                            <Button type="button" size="icon" variant="ghost" className="h-6 w-6" disabled={imageIndex === 0} aria-label="Move photo earlier" onClick={() => setUnitTypes(current => current.map((row, i) => { if (i !== index) return row; const images = [...row.images]; [images[imageIndex - 1], images[imageIndex]] = [images[imageIndex], images[imageIndex - 1]]; return { ...row, images }; }))}><ArrowUp className="h-3 w-3" /></Button>
+                            <Button type="button" size="icon" variant="ghost" className="h-6 w-6" disabled={imageIndex === item.images.length - 1} aria-label="Move photo later" onClick={() => setUnitTypes(current => current.map((row, i) => { if (i !== index) return row; const images = [...row.images]; [images[imageIndex], images[imageIndex + 1]] = [images[imageIndex + 1], images[imageIndex]]; return { ...row, images }; }))}><ArrowDown className="h-3 w-3" /></Button>
                             <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-[11px] text-cream">
                               <input
                                 type="radio"
@@ -1613,9 +1745,10 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                           </div>
                         </div>
                       ))}
-                      {item.imageFiles.map(({ key, file }) => (
+                      {item.imageFiles.map(({ key, file, originalSize }) => (
                         <div key={key} className="flex min-h-20 flex-col justify-between rounded-lg border border-dashed border-gold/30 bg-gold/5 p-2">
                           <span className="truncate text-[11px] text-cream" title={file.name}>{file.name}</span>
+                          <span className="text-[10px] text-muted-foreground">{formatImageBytes(originalSize)} → {formatImageBytes(file.size)}</span>
                           <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-gold">
                             <input
                               type="radio"
@@ -1643,6 +1776,7 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
         <datalist id="unit-type-quick-picks">
           {UNIT_TYPE_QUICK_PICKS.map((label) => <option key={label} value={label} />)}
         </datalist>
+        {existing && previewUnitIndex != null && unitTypes[previewUnitIndex] && <DraftUnitPreview project={existing} unit={unitTypes[previewUnitIndex]} plans={paymentPlans} fees={fees} onClose={() => setPreviewUnitIndex(null)} />}
       </div>
       <div className="space-y-3 rounded-2xl border border-gold/20 bg-black/10 p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1830,8 +1964,26 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                 e.target.value = "";
                 return;
               }
-              setImageFiles((current) => [...current, ...files]);
               e.target.value = "";
+              void (async () => {
+                for (const file of files) {
+                  if (!(await hasAllowedImageSignature(file))) {
+                    toast.error(`${file.name}: file contents do not match its image type`);
+                    return;
+                  }
+                }
+                const prepared = await Promise.all(files.map((file, index) => prepareImageUpload(file, `project-${Date.now()}-${index}`)));
+                setImageFiles((current) => {
+                  const hashes = new Set(current.map((upload) => upload.contentHash));
+                  const unique = prepared.filter((upload) => {
+                    if (hashes.has(upload.contentHash)) return false;
+                    hashes.add(upload.contentHash);
+                    return true;
+                  });
+                  if (unique.length < prepared.length) toast.info(`${prepared.length - unique.length} duplicate image${prepared.length - unique.length === 1 ? " was" : "s were"} skipped`);
+                  return [...current, ...unique];
+                });
+              })();
             }}
           />
         </label>
@@ -1872,6 +2024,7 @@ export function ProjectForm({ id, tenantId, onClose }: { id: string | null; tena
                 <div className="flex items-center gap-2 p-2 text-xs text-muted-foreground">
                   <Upload className="h-3.5 w-3.5 text-gold" />
                   <span className="truncate">{preview.file.name}</span>
+                  <span className="shrink-0">{formatImageBytes(preview.originalSize)} → {formatImageBytes(preview.file.size)}</span>
                 </div>
               </div>
             ))}
@@ -1913,7 +2066,7 @@ function getProjectMediaPath(url: string) {
 // still stamped with the platform admin's own tenant (tenant_id is NOT NULL);
 // what makes a project show on the public map is `is_public`, not which org owns
 // it, so publishing from here works regardless of the owning org.
-export function PublicProjectsManager() {
+export function PublicProjectsManager({ canManage }: { canManage: boolean }) {
   const { data: projects = [], refetch } = useProjects();
   const qc = useQueryClient();
   const { currentTenantId, loaded: tenantLoaded, load: loadTenants } = useTenantStore();
@@ -1977,17 +2130,17 @@ export function PublicProjectsManager() {
           >
             {onlyPublic ? "Show all" : "Show published only"}
           </Button>
-          <Button
+          {canManage ? <Button
             onClick={() => setCreating(true)}
             disabled={!tenantLoaded || !currentTenantId}
             className="bg-gold text-gold-foreground hover:bg-gold/90"
           >
             <Plus className="mr-1 h-4 w-4" /> New project
-          </Button>
+          </Button> : null}
         </div>
       </div>
 
-      {creating && currentTenantId && (
+      {canManage && creating && currentTenantId && (
         <ProjectForm
           id={null}
           tenantId={currentTenantId}
@@ -2018,6 +2171,7 @@ export function PublicProjectsManager() {
               <span className={`text-xs font-medium ${pub ? "text-emerald-400" : "text-muted-foreground"}`}>
                 {pub ? "Public" : "Private"}
               </span>
+              {canManage ? <>
               <Button
                 size="icon"
                 variant="ghost"
@@ -2034,300 +2188,11 @@ export function PublicProjectsManager() {
               <Button size="icon" variant="ghost" onClick={() => del(p.id)}>
                 <Trash2 className="h-4 w-4 text-destructive" />
               </Button>
+              </> : null}
             </div>
           );
         })}
       </div>
-    </div>
-  );
-}
-
-export function SubscribersManager() {
-  const [rows, setRows] = useState<PlatformTenant[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
-
-  const load = async () => {
-    setLoading(true);
-    try {
-      setRows(await fetchPlatformTenants());
-    } catch (err) {
-      toast.error(errMsg(err, "Could not load subscribers"));
-    } finally {
-      setLoading(false);
-    }
-  };
-  useEffect(() => { void load(); }, []);
-
-  const toggleSuspend = async (t: PlatformTenant) => {
-    setBusyId(t.id);
-    try {
-      await setTenantSuspended(t.id, !t.suspended);
-      toast.success(t.suspended ? "Subscriber re-enabled" : "Subscriber suspended");
-      await load();
-    } catch (err) {
-      toast.error(errMsg(err, "Action failed"));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const badge = (t: PlatformTenant) => {
-    if (t.suspended) return { label: "Suspended", cls: "text-destructive" };
-    if (isActiveStatus(t.subscription_status)) return { label: "Active", cls: "text-emerald-400" };
-    return { label: t.subscription_status, cls: "text-muted-foreground" };
-  };
-
-  return (
-    <div id="admin-subscribers" className="mt-10 scroll-mt-24">
-      <h2 className="font-display text-3xl text-cream">Subscribers</h2>
-      <p className="mt-1 text-sm text-muted-foreground">{rows.length} organization{rows.length === 1 ? "" : "s"}</p>
-
-      <div className="mt-4 grid gap-2">
-        {loading && <div className="p-4 text-center text-sm text-muted-foreground">Loading…</div>}
-        {!loading && rows.length === 0 && (
-          <div className="glass gold-hairline rounded-2xl p-4 text-center text-sm text-muted-foreground">No subscribers yet.</div>
-        )}
-        {rows.map((t) => {
-          const b = badge(t);
-          // No `suspended` here: this row already renders a Suspended status
-          // badge, so the pill stays focused on the billing period itself.
-          const period = formatSubscriptionPeriod(t.current_period_end, t.subscription_status);
-          return (
-            <div key={t.id} className="glass gold-hairline flex items-center gap-3 rounded-2xl p-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-                  <span className="truncate font-display text-lg text-cream">{t.name}</span>
-                  {period && (
-                    <span
-                      title={period.title}
-                      className={`glass gold-hairline shrink-0 rounded-full px-2 py-0.5 text-[11px] leading-tight ${period.cls}`}
-                    >
-                      {period.label}
-                      {period.detail ? ` · ${period.detail}` : ""}
-                    </span>
-                  )}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {t.owner_email ?? "—"} · {t.project_count} project{t.project_count === 1 ? "" : "s"}
-                  {t.plan ? ` · ${t.plan}` : ""}
-                </div>
-              </div>
-              <span className={`text-xs font-medium ${b.cls}`}>{b.label}</span>
-              {/* Regular platform admins cannot suspend an org containing a
-                  platform admin. The designated owner override is enforced by
-                  the RPC and is reflected here only for clearer UI feedback. */}
-              {t.has_platform_admin && !t.suspended && !t.can_suspend_platform_admins ? (
-                <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Platform administrators cannot be suspended">
-                  <Shield className="h-3.5 w-3.5" /> Platform admin
-                </span>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={busyId === t.id}
-                  onClick={() => toggleSuspend(t)}
-                  className="glass gold-hairline text-cream"
-                >
-                  <Ban className="mr-1 h-3.5 w-3.5" />
-                  {t.suspended ? "Unsuspend" : "Suspend"}
-                </Button>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// Platform-admin only: every user account (via platform_list_users RPC).
-export function UsersManager() {
-  const [rows, setRows] = useState<PlatformUser[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const { user: currentUser } = useAuth();
-
-  const load = async () => {
-    setLoading(true);
-    try {
-      setRows(await fetchPlatformUsers());
-    } catch (err) {
-      toast.error(errMsg(err, "Could not load users"));
-    } finally {
-      setLoading(false);
-    }
-  };
-  useEffect(() => { void load(); }, []);
-
-  const toggleBlock = async (u: PlatformUser) => {
-    setBusyId(u.user_id);
-    try {
-      await setUserBlocked({ data: { userId: u.user_id, blocked: !u.blocked } });
-      toast.success(u.blocked ? "User unblocked" : "User blocked");
-      await load();
-    } catch (err) {
-      toast.error(errMsg(err, "Could not change user access"));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const remove = async (u: PlatformUser) => {
-    if (!confirm(`Permanently delete ${u.email ?? "this user"} and the organizations they own? This cannot be undone.`)) return;
-    setBusyId(u.user_id);
-    try {
-      await deletePlatformUser(u.user_id);
-      toast.success("User removed");
-      await load();
-    } catch (err) {
-      toast.error(errMsg(err, "Delete failed"));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  return (
-    <div id="admin-users" className="mt-10 scroll-mt-24">
-      <h2 className="font-display text-3xl text-cream">Users</h2>
-      <p className="mt-1 text-sm text-muted-foreground">{rows.length} account{rows.length === 1 ? "" : "s"}</p>
-
-      <div className="mt-4 grid gap-2">
-        {loading && <div className="p-4 text-center text-sm text-muted-foreground">Loading…</div>}
-        {!loading && rows.length === 0 && (
-          <div className="glass gold-hairline rounded-2xl p-4 text-center text-sm text-muted-foreground">No users.</div>
-        )}
-        {rows.map((u) => {
-          const period = formatSubscriptionPeriod(u.current_period_end, u.subscription_status);
-          return (
-          <div key={u.user_id} className="glass gold-hairline flex items-center gap-3 rounded-2xl p-3">
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-                <span className="truncate font-display text-lg text-cream">{u.email ?? "—"}</span>
-                {period && (
-                  <span
-                    title={period.title}
-                    className={`glass gold-hairline shrink-0 rounded-full px-2 py-0.5 text-[11px] leading-tight ${period.cls}`}
-                  >
-                    {period.label}
-                    {period.detail ? ` · ${period.detail}` : ""}
-                  </span>
-                )}
-              </div>
-              <div className="truncate text-xs text-muted-foreground">
-                {u.orgs ? `${u.orgs} (${u.org_roles ?? "member"})` : "no organization"}
-              </div>
-            </div>
-            {u.blocked && (
-              <span className="rounded-full border border-destructive/50 px-2.5 py-1 text-xs text-destructive">
-                Blocked
-              </span>
-            )}
-            {u.is_platform_admin ? (
-              <span className="glass gold-hairline rounded-full px-2.5 py-1 text-xs text-gold">Platform admin</span>
-            ) : (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busyId === u.user_id}
-                onClick={() => remove(u)}
-                className="glass gold-hairline text-destructive"
-              >
-                <Trash2 className="mr-1 h-3.5 w-3.5" /> Remove
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={
-                busyId === u.user_id ||
-                currentUser?.id === u.user_id ||
-                // `blocked` is absent until the account-block SQL is applied to
-                // the database (supabase/APPLY_THIS_4.sql). Disable rather than
-                // let the click fail with a 404 on the missing RPC.
-                u.blocked === undefined ||
-                (u.is_platform_admin && !u.can_block_platform_admins)
-              }
-              onClick={() => void toggleBlock(u)}
-              title={
-                u.blocked === undefined
-                  ? "Account blocking is not installed on this database yet"
-                  : currentUser?.id === u.user_id
-                    ? "You cannot block yourself"
-                    : u.is_platform_admin && !u.can_block_platform_admins
-                      ? "Only ashraf@admin.com can block a platform administrator"
-                      : undefined
-              }
-              className="glass gold-hairline text-destructive"
-            >
-              <Ban className="mr-1 h-3.5 w-3.5" /> {u.blocked ? "Unblock" : "Block"}
-            </Button>
-          </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <Label className="text-xs uppercase tracking-widest text-muted-foreground">{label}</Label>
-      <div className="mt-1">{children}</div>
-    </div>
-  );
-}
-
-// Paste a Google Maps link → pull lat/lng out of it and fill the location. Full
-// URLs are parsed client-side; short goo.gl links are resolved by the
-// `resolve-maps-link` edge function (which follows the redirect server-side).
-function LocationFromLink({ onCoords }: { onCoords: (c: { lat: number; lng: number }) => void }) {
-  const [url, setUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-  const apply = async () => {
-    let c = parseLatLngFromGoogleMapsUrl(url);
-    if (!c && /goo\.gl|maps\.app\.goo\.gl/i.test(url)) {
-      setBusy(true);
-      try {
-        const { data, error } = await supabase.functions.invoke("resolve-maps-link", {
-          body: { url: url.trim() },
-        });
-        if (!error && data && typeof data.lat === "number" && typeof data.lng === "number") {
-          c = { lat: data.lat, lng: data.lng };
-        }
-      } catch {
-        /* fall through to the error toast below */
-      } finally {
-        setBusy(false);
-      }
-    }
-    if (!c) {
-      toast.error(
-        "Couldn't read coordinates from that link. Paste a full Google Maps URL that contains @lat,lng (or deploy the resolve-maps-link function for short goo.gl links).",
-      );
-      return;
-    }
-    onCoords(c);
-    toast.success(`Location set to ${c.lat.toFixed(5)}, ${c.lng.toFixed(5)}`);
-    setUrl("");
-  };
-  return (
-    <div className="flex gap-2">
-      <Input
-        value={url}
-        onChange={(e) => setUrl(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            void apply();
-          }
-        }}
-        placeholder="Paste Google Maps link (…/@25.19,55.27,… or a goo.gl short link)"
-      />
-      <Button type="button" onClick={() => void apply()} disabled={!url.trim() || busy} className="shrink-0">
-        {busy ? "…" : "Set"}
-      </Button>
     </div>
   );
 }

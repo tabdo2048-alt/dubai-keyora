@@ -3,12 +3,11 @@ import { Check, FileDown, Loader2, Ruler, Wallet } from "lucide-react";
 import { toast } from "sonner";
 import type { ProjectWithRelations } from "@/lib/types";
 import { fetchProjectById } from "@/hooks/use-projects";
-import { areaLabel, displayUnitTypes, pricedUnitTypes, projectDetailSlug, type DisplayUnitType, unitDetailSlug } from "@/lib/unit-types";
+import { areaLabel, displayUnitTypes, pricedUnitTypes, canOfferUnit, type DisplayUnitType } from "@/lib/unit-types";
 import { preparePdfImage, projectMainImage, projectOfferImage, unitFloorPlanImage, unitPhotoImage } from "@/lib/pdf-media";
 import { DEFAULT_OFFER_ACCENT_COLOR, DEFAULT_OFFER_PRIMARY_COLOR, safeOfferColor } from "@/lib/offer-branding";
 import { safeHttpUrl } from "@/lib/utils";
 import { displayPaymentPlans, type DisplayPaymentPlan } from "@/lib/payment-plans";
-import { whatsappUrl, CONTACT_WHATSAPP } from "@/lib/contact";
 import {
   calculatePaymentPlan,
   formatCurrency,
@@ -23,21 +22,28 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { recordUsageEvent } from "@/features/usage/client";
+
+const OFFER_QR_URL = "https://www.tiktok.com/@hassan_abu_allail?_r=1&_t=ZS-99tF31wkWsn";
 
 export function UnitOfferDialog({
   project,
   initialUnitId,
+  lockUnitSelection = false,
+  previewOnly = false,
   open,
   onOpenChange,
 }: {
   project: ProjectWithRelations;
   initialUnitId?: string;
+  lockUnitSelection?: boolean;
+  previewOnly?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const [offerProject, setOfferProject] = useState(project);
   const [loadingProject, setLoadingProject] = useState(false);
-  const units = useMemo(() => pricedUnitTypes(displayUnitTypes(offerProject.unit_types, offerProject.starting_price_aed)), [offerProject]);
+  const units = useMemo(() => pricedUnitTypes(displayUnitTypes(offerProject.unit_types, offerProject.starting_price_aed)).filter(canOfferUnit), [offerProject]);
   const plans = useMemo(() => displayPaymentPlans(offerProject.payment_plans, offerProject.payment_plan), [offerProject]);
   const [selectedUnitId, setSelectedUnitId] = useState(units[0]?.id ?? "");
   const [selectedPlanId, setSelectedPlanId] = useState("");
@@ -46,7 +52,7 @@ export function UnitOfferDialog({
   useEffect(() => {
     let active = true;
     setOfferProject(project);
-    if (!open) {
+    if (!open || previewOnly) {
       setLoadingProject(false);
       return () => {
         active = false;
@@ -68,18 +74,21 @@ export function UnitOfferDialog({
     return () => {
       active = false;
     };
-  }, [open, project]);
+  }, [open, project, previewOnly]);
 
   useEffect(() => {
-    setSelectedUnitId(units.find((unit) => unit.id === initialUnitId)?.id ?? units[0]?.id ?? "");
-  }, [initialUnitId, offerProject.id, units]);
+    const requestedUnit = units.find((unit) => unit.id === initialUnitId)?.id;
+    setSelectedUnitId(requestedUnit ?? (lockUnitSelection ? "" : units[0]?.id ?? ""));
+  }, [initialUnitId, lockUnitSelection, offerProject.id, units]);
 
   useEffect(() => {
     const defaultPlan = plans.find((plan) => plan.is_default) ?? plans[0];
     setSelectedPlanId(defaultPlan?.id ?? "");
   }, [offerProject.id, plans]);
 
-  const selectedUnit = units.find((unit) => unit.id === selectedUnitId) ?? null;
+  const selectedUnit = lockUnitSelection && initialUnitId
+    ? units.find((unit) => unit.id === initialUnitId) ?? null
+    : units.find((unit) => unit.id === selectedUnitId) ?? null;
   const selectedPlan = plans.find((plan) => plan.id === selectedPlanId) ?? null;
   const calculation = useMemo<OfferCalculation | null>(() => {
     if (!selectedUnit || !selectedPlan || selectedUnit.price_aed == null) return null;
@@ -91,6 +100,7 @@ export function UnitOfferDialog({
   const canGenerate = Boolean(!loadingProject && calculation?.installments.length && calculation.validation.valid);
 
   async function generateOffer() {
+    if (generating) return;
     if (loadingProject) {
       toast.error("Project details are still loading");
       return;
@@ -118,34 +128,37 @@ export function UnitOfferDialog({
       previewWindow.document.title = "Preparing sales offer PDF…";
     }
     try {
+      const freshProject = previewOnly ? project : await fetchProjectById(project.id);
+      const freshUnit = freshProject?.unit_types.find(unit => unit.id === selectedUnit.id);
+      if (!freshProject || (selectedUnit.id !== "legacy-starting-price" && (!freshUnit || !canOfferUnit(freshUnit)))) {
+        throw new Error("This unit is no longer available for an offer. Refresh the page.");
+      }
+      if (freshUnit && freshUnit.price_aed !== selectedUnit.price_aed) {
+        setOfferProject(freshProject);
+        throw new Error("The unit price changed. Review the updated price and generate again.");
+      }
+      if (!previewOnly) {
+        const latestPlan = displayPaymentPlans(freshProject.payment_plans, freshProject.payment_plan).find(plan => plan.id === selectedPlan.id);
+        if (!latestPlan || JSON.stringify(calculatePaymentPlan(freshUnit?.price_aed ?? selectedUnit.price_aed!, latestPlan, freshProject.fees)) !== JSON.stringify(calculation)) {
+          setOfferProject(freshProject);
+          throw new Error("Payment terms changed. Review the updated plan and generate again.");
+        }
+      }
       const [{ pdf }, { UnitSalesOfferPdf }, QRCode] = await Promise.all([
         import("@react-pdf/renderer"),
         import("@/pdf/UnitSalesOfferPdf"),
         import("qrcode"),
       ]);
-      const offerId = createOfferId(offerProject.slug, selectedUnit);
+      const offerId = `${previewOnly ? "DRAFT-" : ""}${createOfferId(offerProject.slug, selectedUnit)}`;
       const offerDate = formatDate(new Date());
       const validUntilDate = new Date();
       validUntilDate.setDate(validUntilDate.getDate() + 7);
       const validUntil = formatDate(validUntilDate);
-      const baseUrl = (import.meta.env.VITE_PUBLIC_APP_URL as string | undefined)?.trim() ||
-        (import.meta.env.VITE_APP_URL as string | undefined)?.trim() ||
-        window.location.origin;
-      const unitPath = unitDetailSlug({
-        projectName: offerProject.name,
-        projectSlug: offerProject.slug,
-        developerName: offerProject.developer?.name,
-        developerSlug: offerProject.developer?.slug,
-        unitLabel: selectedUnit.label,
+      const qrCodeDataUrl = await QRCode.toDataURL(OFFER_QR_URL, {
+        errorCorrectionLevel: "M",
+        margin: 1,
+        width: 256,
       });
-      const shareUrl = `${baseUrl.replace(/\/$/, "")}/projects/${encodeURIComponent(projectDetailSlug({ name: offerProject.name, slug: offerProject.slug }))}/units/${encodeURIComponent(unitPath)}?offer=${encodeURIComponent(offerId)}`;
-      // VITE_OFFER_QR_URL can point the PDF QR to any URL. Keep the WhatsApp
-      // contact link as the fallback for existing environments.
-      const configuredQrUrl = (import.meta.env.VITE_OFFER_QR_URL as string | undefined)?.trim();
-      const qrTarget = configuredQrUrl || whatsappUrl(offerProject.name);
-      const qrCodeDataUrl = qrTarget
-        ? await QRCode.toDataURL(qrTarget, { errorCorrectionLevel: "M", margin: 1, width: 256 })
-        : undefined;
       const [projectImageSrc, projectMainImageSrc, unitPhotoImageSrc, unitPlanImageSrc, developerLogoSrc] = await Promise.all([
         preparePdfImage(projectOfferImage(offerProject)),
         preparePdfImage(projectMainImage(offerProject)),
@@ -163,8 +176,6 @@ export function UnitOfferDialog({
           offerDate={offerDate}
           validUntil={validUntil}
           qrCodeDataUrl={qrCodeDataUrl}
-          whatsappNumber={CONTACT_WHATSAPP ?? undefined}
-          shareUrl={shareUrl}
           projectImageSrc={projectImageSrc || undefined}
           projectMainImageSrc={projectMainImageSrc || undefined}
           unitPhotoImageSrc={unitPhotoImageSrc || undefined}
@@ -172,12 +183,20 @@ export function UnitOfferDialog({
           developerLogoSrc={developerLogoSrc || undefined}
         />,
       ).toBlob();
+      if (!previewOnly) {
+        void recordUsageEvent("pdf_generated", {
+          project_id: offerProject.id,
+          unit_type_id: selectedUnit.id,
+          payment_plan_id: selectedPlan.id,
+        }, offerProject.tenant_id);
+      }
       const url = URL.createObjectURL(blob);
       if (!previewWindow) {
         const anchor = document.createElement("a");
         anchor.href = url;
         anchor.download = `${safeFileName(offerProject.name)}-${safeFileName(selectedUnit.label)}-${offerId}.pdf`;
         anchor.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
         toast.success("Popup was blocked, so the sales offer PDF was downloaded");
       } else {
         previewWindow.location.href = url;
@@ -199,28 +218,51 @@ export function UnitOfferDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto border-gold/30 bg-background/95 text-cream backdrop-blur-xl">
         <DialogHeader>
-          <DialogTitle className="font-display text-2xl text-cream">Create sales offer</DialogTitle>
-          <DialogDescription className="text-muted-foreground">Choose the unit type and a saved payment plan. All PDF stages and amounts come from that plan’s configured installments.</DialogDescription>
+          <DialogTitle className="font-display text-2xl text-cream">{previewOnly ? "Draft preview — not saved" : "Create sales offer"}</DialogTitle>
+          <DialogDescription className="text-muted-foreground">
+            {lockUnitSelection
+              ? "This sales offer is fixed to the unit you are viewing. Choose only the saved payment plan."
+              : "Choose the unit type and a saved payment plan. All PDF stages and amounts come from that plan’s configured installments."}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-5 lg:grid-cols-[1fr_1.1fr]">
           <div className="space-y-4">
-            <SelectionGroup title="1. Select unit type" icon={<Ruler className="h-4 w-4 text-gold" />}>
-              {units.length === 0 ? (
-                <EmptyState>There are no priced unit types available for this project.</EmptyState>
-              ) : (
-                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
-                  {units.map((unit) => (
-                    <ChoiceButton key={unit.id} selected={unit.id === selectedUnitId} onClick={() => setSelectedUnitId(unit.id)}>
-                      <span className="min-w-0 text-left"><span className="block font-medium text-cream">{unit.label}</span>{areaLabel(unit) && <span className="block text-xs text-muted-foreground">{areaLabel(unit)}</span>}</span>
-                      <span className="shrink-0 text-sm text-gold-gradient">{formatCurrency(unit.price_aed)}</span>
-                    </ChoiceButton>
-                  ))}
-                </div>
-              )}
-            </SelectionGroup>
+            {lockUnitSelection ? (
+              <SelectionGroup title="Selected unit" icon={<Ruler className="h-4 w-4 text-gold" />}>
+                {selectedUnit ? (
+                  <div className="rounded-xl border border-gold bg-gold/10 p-3 ring-1 ring-gold/40">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block font-medium text-cream">{selectedUnit.label}</span>
+                        {areaLabel(selectedUnit) && <span className="block text-xs text-muted-foreground">{areaLabel(selectedUnit)}</span>}
+                      </span>
+                      <span className="shrink-0 text-sm text-gold-gradient">{formatCurrency(selectedUnit.price_aed)}</span>
+                    </div>
+                    <div className="mt-2 text-[10px] uppercase tracking-widest text-gold">Locked to this unit</div>
+                  </div>
+                ) : (
+                  <EmptyState>The selected unit is unavailable or has no price.</EmptyState>
+                )}
+              </SelectionGroup>
+            ) : (
+              <SelectionGroup title="1. Select unit type" icon={<Ruler className="h-4 w-4 text-gold" />}>
+                {units.length === 0 ? (
+                  <EmptyState>There are no priced unit types available for this project.</EmptyState>
+                ) : (
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
+                    {units.map((unit) => (
+                      <ChoiceButton key={unit.id} selected={unit.id === selectedUnitId} onClick={() => setSelectedUnitId(unit.id)}>
+                        <span className="min-w-0 text-left"><span className="block font-medium text-cream">{unit.label}</span>{areaLabel(unit) && <span className="block text-xs text-muted-foreground">{areaLabel(unit)}</span>}</span>
+                        <span className="shrink-0 text-sm text-gold-gradient">{formatCurrency(unit.price_aed)}</span>
+                      </ChoiceButton>
+                    ))}
+                  </div>
+                )}
+              </SelectionGroup>
+            )}
 
-            <SelectionGroup title="2. Select payment plan" icon={<Wallet className="h-4 w-4 text-gold" />}>
+            <SelectionGroup title={lockUnitSelection ? "1. Select payment plan" : "2. Select payment plan"} icon={<Wallet className="h-4 w-4 text-gold" />}>
               {plans.length === 0 ? (
                 <EmptyState>No payment plan has been configured for this project.</EmptyState>
               ) : (
