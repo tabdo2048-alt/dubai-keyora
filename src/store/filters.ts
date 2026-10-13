@@ -12,6 +12,9 @@ type FiltersStore = {
 
   selectedProjectId: string | null;
   setSelectedProjectId: (id: string | null) => void;
+  compareProjectIds: string[];
+  toggleCompareProject: (id: string) => "added" | "removed" | "full";
+  clearComparison: () => void;
 
   // Project the pointer is over (sidebar card OR map marker) — syncs the
   // highlight across both panes. Transient, not persisted.
@@ -67,6 +70,23 @@ export const useFiltersStore = create<FiltersStore>((set) => ({
 
   selectedProjectId: null,
   setSelectedProjectId: (id) => set({ selectedProjectId: id }),
+  compareProjectIds: [],
+  toggleCompareProject: (id) => {
+    let result: "added" | "removed" | "full" = "added";
+    set((state) => {
+      if (state.compareProjectIds.includes(id)) {
+        result = "removed";
+        return { compareProjectIds: state.compareProjectIds.filter((item) => item !== id) };
+      }
+      if (state.compareProjectIds.length >= 3) {
+        result = "full";
+        return state;
+      }
+      return { compareProjectIds: [...state.compareProjectIds, id] };
+    });
+    return result;
+  },
+  clearComparison: () => set({ compareProjectIds: [] }),
 
   hoveredProjectId: null,
   setHoveredProjectId: (id) => set({ hoveredProjectId: id }),
