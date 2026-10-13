@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
-import { Building2, CheckCircle2, Database, Download, ExternalLink, Info, LineChart, Loader2, MapPin, RotateCcw, Search, ShieldCheck, WalletCards } from "lucide-react";
+import { AlertTriangle, BrainCircuit, Building2, CheckCircle2, Database, Download, ExternalLink, Info, LineChart, Loader2, MapPin, RotateCcw, Search, ShieldCheck, Target, WalletCards } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -8,6 +8,8 @@ import { calculateInvestment, type InvestmentInputs } from "@/lib/investment-ana
 import { displayPaymentPlans, type DisplayPaymentPlan } from "@/lib/payment-plans";
 import { displayUnitTypes, pricedUnitTypes } from "@/lib/unit-types";
 import { toast } from "sonner";
+import { MarketDiscoveryPanel } from "@/components/analysis/MarketDiscoveryPanel";
+import { buildMarketDecision, type InvestorRisk, type InvestorStrategy } from "@/lib/market-decision";
 
 function ManagementPageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action: ReactNode }) {
   return <header className="flex flex-col gap-4 rounded-3xl border border-gold/20 bg-gradient-to-br from-gold/10 to-transparent p-6 md:flex-row md:items-center md:justify-between"><div><p className="text-xs uppercase tracking-widest text-gold">{eyebrow}</p><h1 className="mt-2 font-display text-3xl text-cream">{title}</h1><p className="mt-2 max-w-2xl text-sm text-muted-foreground">{description}</p></div>{action}</header>;
@@ -88,6 +90,8 @@ export function InvestmentAnalysis() {
   const [loadedFromProject, setLoadedFromProject] = useState(false);
   const [sources, setSources] = useState(sourceDefaults);
   const [comparison, setComparison] = useState<ComparisonItem[]>([]);
+  const [strategy, setStrategy] = useState<InvestorStrategy>("balanced");
+  const [risk, setRisk] = useState<InvestorRisk>("medium");
   const projectsQuery = useProjects();
   const projectQuery = useProjectById(selectedProjectId || null);
   const project = projectQuery.data;
@@ -97,6 +101,7 @@ export function InvestmentAnalysis() {
   const selectedPlan = plans.find((item) => item.id === selectedPlanId) ?? plans.find((item) => item.is_default) ?? plans[0];
   const result = useMemo(() => calculateInvestment(inputs), [inputs]);
   const researchCount = Object.values(sources).filter((source) => source.rent > 0 || source.psf > 0).length;
+  const decision = useMemo(() => buildMarketDecision({ result, researchCount, hasWorkspaceProject: loadedFromProject, strategy, risk }), [loadedFromProject, researchCount, result, risk, strategy]);
   const addComparison = () => {
     if (!loadedFromProject || !selectedProjectId) { toast.info("اختار مشروع وحمّل بياناته أولًا."); return; }
     if (inputs.price <= 0 || inputs.sizeSqft <= 0 || Math.abs(result.paymentTotalPct - 100) >= 0.01) {
@@ -170,6 +175,7 @@ export function InvestmentAnalysis() {
     <div dir="rtl" className={`rounded-2xl border p-4 text-sm ${loadedFromProject ? "border-emerald-400/20 bg-emerald-400/5 text-emerald-200" : "border-amber-400/30 bg-amber-400/10 text-amber-100"}`}>
       {loadedFromProject ? `بيانات الصفقة من المشروع المختار. ${researchCount ? `${researchCount} مصادر سوق مدخلة يدويًا.` : "الإيجار والنمو وأسعار السوق افتراضات قابلة للتعديل؛ لم يتم التحقق منها بمصادر."}` : "وضع تجريبي: الأرقام الحالية مثال حسابي، وليست بيانات السوق الكلية أو نتائج مشروع مختار."}
     </div>
+    <MarketDiscoveryPanel projects={projectsQuery.data ?? []} loading={projectsQuery.isLoading} onSelectProject={chooseProject} />
     <section dir="rtl" className="glass gold-hairline rounded-3xl p-5 sm:p-6">
       <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-display text-2xl text-cream">مقارنة المشاريع</h2><p className="mt-1 text-sm text-muted-foreground">حمّل بيانات مشروع ووحدة، راجع افتراضاتهما، ثم أضف التحليل. كرر لمشروع آخر للمقارنة.</p></div><div className="flex gap-2"><Button onClick={addComparison} disabled={!loadedFromProject}>أضف التحليل للمقارنة ({comparison.length}/3)</Button>{comparison.length > 0 && <Button variant="outline" onClick={() => setComparison([])}>مسح المقارنة</Button>}</div></div>
       {comparison.length === 0 ? <p className="mt-5 rounded-2xl border border-dashed border-gold/20 p-5 text-sm text-muted-foreground">لم تضف مشاريع بعد. استخدم اختيار المشروع أدناه أولًا.</p> : <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[650px] text-right text-sm"><thead><tr><th className="p-3 text-muted-foreground">المؤشر</th>{comparison.map((item) => <th key={item.key} className="min-w-48 p-3"><div className="text-cream">{item.inputs.projectName}</div><div className="mt-1 text-xs font-normal text-gold">{item.inputs.unitLabel}</div><button type="button" className="mt-2 text-xs font-normal text-muted-foreground underline" onClick={() => setComparison((current) => current.filter((value) => value.key !== item.key))}>إزالة</button></th>)}</tr></thead><tbody>{[
@@ -214,10 +220,31 @@ export function InvestmentAnalysis() {
 
     <section><h2 className="mb-4 font-display text-2xl text-cream">3. نتيجة الصفقة</h2><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><Metric label="Profit at handover" value={moneyValue(result.profit)} hint={`${pctValue(result.lifecycleReturnPct)} lifecycle · ${pctValue(result.annualizedReturnPct)} annualised`} tone={result.profit >= 0 ? "green" : "red"} /><Metric label="Net rental yield" value={pctValue(result.netYieldPct)} hint={`${moneyValue(result.netRent)} net rent after costs`} tone={result.netYieldPct >= 6 ? "green" : result.netYieldPct < 5 ? "red" : "gold"} /><Metric label="Break-even sale" value={moneyValue(result.breakEvenSale)} hint={`${pctValue(result.cushionPct)} cushion versus today's area value`} tone={result.cushionPct >= 0 ? "green" : "red"} /><Metric label="Cash-on-cash" value={pctValue(result.cashOnCashPct)} hint={`On ${moneyValue(result.cashInvested)} paid before handover`} tone={result.profit >= 0 ? "green" : "red"} /></div></section>
 
+    <section dir="rtl" className="glass gold-hairline overflow-hidden rounded-3xl">
+      <div className="border-b border-white/10 bg-gradient-to-l from-gold/10 to-transparent p-5 sm:p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex items-start gap-3"><BrainCircuit className="mt-1 h-6 w-6 text-gold" /><div><div className="text-[10px] uppercase tracking-[0.24em] text-gold">KEYORA decision engine · مجاني</div><h2 className="mt-1 font-display text-3xl text-cream">تعمل إيه دلوقتي؟</h2><p className="mt-2 max-w-2xl text-sm text-muted-foreground">تقييم شفاف مبني على العائد، سيناريو الهبوط، هامش الأمان، اكتمال البيانات واستراتيجيتك. لا يحتاج اشتراك AI مدفوع.</p></div></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-2"><Label>هدفك</Label><select value={strategy} onChange={(event) => setStrategy(event.target.value as InvestorStrategy)} className="h-10 rounded-md border border-white/10 bg-black/30 px-3 text-sm text-cream"><option value="balanced">متوازن</option><option value="income">دخل إيجاري</option><option value="growth">نمو رأسمالي</option></select></div>
+            <div className="space-y-2"><Label>تحمل المخاطر</Label><select value={risk} onChange={(event) => setRisk(event.target.value as InvestorRisk)} className="h-10 rounded-md border border-white/10 bg-black/30 px-3 text-sm text-cream"><option value="low">منخفض</option><option value="medium">متوسط</option><option value="high">مرتفع</option></select></div>
+          </div>
+        </div>
+      </div>
+      <div className="grid gap-5 p-5 sm:p-6 xl:grid-cols-[280px_1fr]">
+        <div className="rounded-3xl border border-gold/25 bg-gold/10 p-5"><div className="text-xs text-muted-foreground">Decision score</div><div className="mt-2 font-display text-6xl text-gold">{decision.score}<span className="text-xl text-muted-foreground">/100</span></div><div className="mt-4 rounded-full border border-gold/20 bg-black/20 px-3 py-2 text-center text-sm font-semibold text-cream">{decision.action}</div><p className="mt-3 text-center text-xs text-muted-foreground">ثقة {decision.confidence}</p></div>
+        <div><p className="text-lg leading-8 text-cream">{decision.summary}</p><div className="mt-5 grid gap-4 md:grid-cols-3"><DecisionList title="عوامل إيجابية" icon={<CheckCircle2 className="h-4 w-4 text-emerald-300" />} items={decision.positives} empty="لا توجد عوامل مؤكدة بعد." /><DecisionList title="مخاطر" icon={<AlertTriangle className="h-4 w-4 text-amber-300" />} items={decision.risks} empty="لم تظهر مخاطر حسابية كبيرة." /><DecisionList title="الخطوة التالية" icon={<Target className="h-4 w-4 text-gold" />} items={decision.nextSteps} /></div></div>
+      </div>
+      <div className="border-t border-white/10 px-5 py-3 text-xs text-muted-foreground">هذا محرك قرار حسابي قابل للتفسير وليس ضمانًا للربح أو بديلًا عن الفحص القانوني والمالي المستقل.</div>
+    </section>
+
     <section className="glass gold-hairline rounded-3xl p-5 sm:p-6"><div className="flex justify-between gap-3"><div><div className="text-[10px] uppercase tracking-[0.24em] text-gold">Current view</div><h2 className="mt-1 font-display text-2xl text-cream">{result.verdict}</h2></div><div className="text-sm text-muted-foreground">Normal value {moneyValue(result.normalPsf)} / ft²</div></div><div className="mt-6 overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="text-[10px] uppercase text-muted-foreground"><tr><th className="pb-3">Scenario</th><th>Growth</th><th>Sale at handover</th><th>Profit</th><th>Return</th></tr></thead><tbody>{result.marketScenarios.map((item) => <tr key={item.label} className="border-t border-white/10"><td className="py-3 text-cream">{item.label}</td><td>{pctValue(item.growthPct)}</td><td>{moneyValue(item.salePrice)}</td><td className={item.profit >= 0 ? "text-emerald-300" : "text-red-300"}>{moneyValue(item.profit)}</td><td>{pctValue(item.returnPct)}</td></tr>)}</tbody></table></div></section>
 
     <section className="grid gap-6 xl:grid-cols-2"><div className="glass gold-hairline rounded-3xl p-5"><h2 className="font-display text-2xl text-cream">Rent scenarios</h2><div className="mt-5 grid gap-3 sm:grid-cols-2">{result.rentScenarios.map((item) => <div key={item.label} className="rounded-2xl border border-white/10 bg-black/15 p-4"><div className="text-xs text-muted-foreground">{item.label} · {pctValue(item.growthPct)}</div><div className="mt-2 font-display text-xl text-cream">{moneyValue(item.netRent)}</div><div className="mt-1 text-xs text-gold">{pctValue(item.yieldPct)} net yield</div></div>)}</div></div><div className="glass gold-hairline rounded-3xl p-5"><h2 className="font-display text-2xl text-cream">Payment plan</h2><div className="mt-5 grid grid-cols-2 gap-3"><Field label="Booking" value={inputs.bookingPct} onChange={(v) => set("bookingPct", v)} suffix="%" /><Field label="Construction" value={inputs.constructionPct} onChange={(v) => set("constructionPct", v)} suffix="%" /><Field label="Handover" value={inputs.handoverPct} onChange={(v) => set("handoverPct", v)} suffix="%" /><Field label="Post-handover" value={inputs.postHandoverPct} onChange={(v) => set("postHandoverPct", v)} suffix="%" /></div><div className={`mt-3 text-xs ${Math.abs(result.paymentTotalPct - 100) < 0.01 ? "text-emerald-300" : "text-red-300"}`}>Plan total: {pctValue(result.paymentTotalPct)}{Math.abs(result.paymentTotalPct - 100) < 0.01 ? " — valid" : " — must equal 100%"}</div></div></section>
 
     <div className="flex items-start gap-3 rounded-2xl border border-gold/20 bg-gold/5 p-4 text-xs leading-relaxed text-muted-foreground"><Info className="mt-0.5 h-4 w-4 shrink-0 text-gold" /><p>KEYORA لا يسحب مواقع الطرف الثالث خلسة. افتح المصادر وسجل البيانات التي تحققت منها؛ المصادر المدفوعة تحتاج حسابًا صالحًا. Method adapted for KEYORA from The Ultimate Real Estate Calculator · Off-plan Report v1.1.0 © 2026 Abdulla Alzarooni. Estimates only; not financial advice.</p></div>
   </div>;
+}
+
+function DecisionList({ title, icon, items, empty }: { title: string; icon: ReactNode; items: string[]; empty?: string }) {
+  return <div className="rounded-2xl border border-white/10 bg-black/15 p-4"><div className="flex items-center gap-2 text-sm font-semibold text-cream">{icon}{title}</div><ul className="mt-3 space-y-2 text-xs leading-5 text-muted-foreground">{items.length ? items.map((item) => <li key={item}>• {item}</li>) : <li>{empty}</li>}</ul></div>;
 }
