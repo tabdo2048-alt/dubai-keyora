@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { MapPin, Bed, ChevronLeft, ChevronRight, Building2, X, Eye, EyeOff, Hexagon, Search, ArrowUpDown } from "lucide-react";
+import { MapPin, Bed, ChevronLeft, ChevronRight, Building2, X, Eye, EyeOff, Hexagon, Search, ArrowUpDown, GitCompareArrows } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { useProjects, filterProjects, useCommunities } from "@/hooks/use-projects";
 import { useFiltersStore } from "@/store/filters";
@@ -10,6 +10,7 @@ import { mediaSrc } from "@/lib/media";
 import { track } from "@/lib/analytics";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
 
 const PRICE_RANGES: { label: string; min: number | null; max: number | null }[] = [
   { label: "< 1M", min: null, max: 1_000_000 },
@@ -26,6 +27,8 @@ export function AppSidebar() {
     reset,
     selectedProjectId,
     setSelectedProjectId,
+    compareProjectIds,
+    toggleCompareProject,
     sidebarOpen,
     setSidebarOpen,
     visibleProjectIds,
@@ -36,10 +39,10 @@ export function AppSidebar() {
     hoveredProjectId,
     setHoveredProjectId,
   } = useFiltersStore();
-  const { data: projects = [], isLoading } = useProjects();
+  const { data: projects = [], isLoading, isError, isFetching, refetch } = useProjects();
   const { data: communities = [] } = useCommunities();
   const [sortBy, setSortBy] = useState<SortKey>("default");
-  const filteredRaw = filterProjects(projects, filters);
+  const filteredRaw = useMemo(() => filterProjects(projects, filters), [projects, filters]);
   const filtered = useMemo(() => sortProjects(filteredRaw, sortBy), [filteredRaw, sortBy]);
   const activeChips = useMemo(() => buildActiveChips(filters, communities), [filters, communities]);
   const countDisplay = useCountUp(filtered.length);
@@ -205,6 +208,15 @@ export function AppSidebar() {
             </div>
           )}
           <div className="space-y-2">
+            {isError && (
+              <div className="glass gold-hairline rounded-2xl p-5 text-center" role="alert">
+                <p className="text-sm text-cream">Could not refresh projects.</p>
+                <p className="mt-1 text-xs text-muted-foreground">Check your connection and try again.</p>
+                <Button type="button" size="sm" variant="outline" className="mt-3" disabled={isFetching} onClick={() => void refetch()}>
+                  {isFetching ? "Retrying…" : "Try again"}
+                </Button>
+              </div>
+            )}
             {filtered.map((p, i) => {
               const selected = p.id === selectedProjectId;
               const hovered = p.id === hoveredProjectId;
@@ -264,6 +276,14 @@ export function AppSidebar() {
                     </div>
                   </div>
                 </button>
+                <button type="button" onClick={(event) => {
+                  event.stopPropagation();
+                  if (toggleCompareProject(p.id) === "full") toast.info("Compare up to three projects. Remove one to add another.");
+                }} aria-label={compareProjectIds.includes(p.id) ? `Remove ${p.name} from comparison` : `Compare ${p.name}`}
+                  title={compareProjectIds.includes(p.id) ? "Remove from comparison" : "Compare"}
+                  className={`glass gold-hairline absolute bottom-2 right-2 z-10 grid size-7 place-items-center rounded-full ${compareProjectIds.includes(p.id) ? "text-gold" : "text-muted-foreground hover:text-cream"}`}>
+                  <GitCompareArrows className="size-3.5" />
+                </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -295,9 +315,10 @@ export function AppSidebar() {
                 </motion.div>
               );
             })}
-            {!isLoading && filtered.length === 0 && (
+            {!isLoading && !isError && filtered.length === 0 && (
               <div className="glass gold-hairline rounded-2xl p-6 text-center text-sm text-muted-foreground">
-                No projects match your filters.
+                <p>{projects.length ? "No projects match your filters." : "No projects are available yet."}</p>
+                {projects.length > 0 && <Button type="button" size="sm" variant="outline" className="mt-3" onClick={reset}>Clear filters</Button>}
               </div>
             )}
           </div>
