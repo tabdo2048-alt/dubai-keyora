@@ -23,6 +23,7 @@ import { CategoryPanel } from "./CategoryPanel";
 import { LayersMenu } from "./LayersMenu";
 import { EmiratesMenu } from "./EmiratesMenu";
 import { ProjectPopup } from "./ProjectPopup";
+import { ProjectCompareDock } from "./ProjectCompareDock";
 // Dev-only editor. Lazy so its static WaterLayer import (Three.js + the ~1.6 MB
 // coastline) never enters the production bundle and doesn't defeat the dynamic
 // WaterLayer split in MapboxView.
@@ -94,6 +95,7 @@ export function MapContainer() {
   const canUseMetro = !!user && tenantLoaded && tenants.some(canAccessTenant);
   const {
     filters,
+    setFilters,
     mapMode,
     setMapMode,
     metroMode,
@@ -145,6 +147,7 @@ export function MapContainer() {
     lng: DUBAI_CENTER.lng,
     zoom: DEFAULT_ZOOM,
   });
+  const [shareReady, setShareReady] = useState(false);
   useEffect(() => {
     const saved = readMapViewSession();
     if (saved) {
@@ -152,11 +155,56 @@ export function MapContainer() {
       setMapMode(saved.mode);
       setRestoredCamera(true);
     }
+    const params = new URLSearchParams(window.location.search);
+    const mode = params.get("mode");
+    if (mode === "satellite" || mode === "3d") setMapMode(mode);
+    if (params.has("project")) setSelectedProjectId(params.get("project"));
+    const lat = Number(params.get("lat"));
+    const lng = Number(params.get("lng"));
+    const zoom = Number(params.get("zoom"));
+    if (["lat", "lng", "zoom"].every((key) => params.has(key)) && Number.isFinite(lat) && Number.isFinite(lng) && Number.isFinite(zoom)
+      && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && zoom >= 1 && zoom <= 22) {
+      setCamera({ lat, lng, zoom });
+      setRestoredCamera(true);
+    }
+    if (["q", "types", "status", "areas", "min", "max", "beds"].some((key) => params.has(key))) {
+      setFilters({
+        search: params.get("q") ?? "",
+        categories: params.get("types")?.split(",").filter(Boolean) ?? [],
+        statuses: params.get("status")?.split(",").filter(Boolean) ?? [],
+        communities: params.get("areas")?.split(",").filter(Boolean) ?? [],
+        minPrice: parseShareNumber(params.get("min")),
+        maxPrice: parseShareNumber(params.get("max")),
+        bedrooms: parseShareNumber(params.get("beds")),
+      });
+    }
+    setShareReady(true);
     setMapSessionReady(true);
-  }, [setMapMode]);
+  }, [setMapMode, setSelectedProjectId, setFilters]);
   useEffect(() => {
     if (mapSessionReady) saveMapViewSession({ camera, mode: mapMode });
   }, [mapSessionReady, camera, mapMode]);
+  useEffect(() => {
+    if (!shareReady) return;
+    const timer = window.setTimeout(() => {
+      const params = new URLSearchParams();
+      if (selectedProjectId) params.set("project", selectedProjectId);
+      if (mapMode !== "satellite") params.set("mode", mapMode);
+      if (filters.search.trim()) params.set("q", filters.search.trim());
+      if (filters.categories.length) params.set("types", filters.categories.join(","));
+      if (filters.statuses.length) params.set("status", filters.statuses.join(","));
+      if (filters.communities.length) params.set("areas", filters.communities.join(","));
+      if (filters.minPrice != null) params.set("min", String(filters.minPrice));
+      if (filters.maxPrice != null) params.set("max", String(filters.maxPrice));
+      if (filters.bedrooms != null) params.set("beds", String(filters.bedrooms));
+      params.set("lat", camera.lat.toFixed(5));
+      params.set("lng", camera.lng.toFixed(5));
+      params.set("zoom", camera.zoom.toFixed(2));
+      const next = `${window.location.pathname}?${params}${window.location.hash}`;
+      if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== next) window.history.replaceState(window.history.state, "", next);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [shareReady, selectedProjectId, mapMode, filters, camera]);
   const { data: poisData = [], error: poisError } = usePois(activeCategories, camera);
   // While browsing places, the map goes clean: projects, metro/train/roads and
   // the (dark-dimming) zone spotlight all hide, leaving just the POI markers.
@@ -203,8 +251,12 @@ export function MapContainer() {
   // Projects start hidden; only those the user has revealed (eye toggle) draw as
   // markers. Category mode hides all project markers regardless.
   const projectsToShow = useMemo(
-    () => filtered.filter((p) => visibleProjectIds.has(p.id)),
-    [filtered, visibleProjectIds]
+    () => {
+      const visible = filtered.filter((p) => visibleProjectIds.has(p.id));
+      const selectedProject = projects.find((p) => p.id === selectedProjectId);
+      return selectedProject && !visible.some((p) => p.id === selectedProject.id) ? [...visible, selectedProject] : visible;
+    },
+    [filtered, projects, visibleProjectIds, selectedProjectId]
   );
   const selected =
     projectsToShow.find((p) => p.id === selectedProjectId) ??
@@ -644,9 +696,17 @@ export function MapContainer() {
       <ProjectPopup
         project={cinematicProjectId ? null : selected}
         onClose={() => setSelectedProjectId(null)}
+        onExploreTour={(projectId) => void launchProjectTour(projectId)}
       />
+      <ProjectCompareDock />
     </div>
   );
+}
+
+function parseShareNumber(value: string | null): number | null {
+  if (!value) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function hasProject3d(project: ProjectWithRelations) {
