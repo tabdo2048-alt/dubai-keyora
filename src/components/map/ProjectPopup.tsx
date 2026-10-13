@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, MapPin, Bed, Calendar, Wallet, Building2, ArrowRight, MessageCircle, CalendarCheck, Ruler, FileDown } from "lucide-react";
+import { X, MapPin, Bed, Calendar, Wallet, Building2, ArrowRight, MessageCircle, CalendarCheck, Ruler, FileDown, GitCompareArrows, Share2 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import type { ProjectWithRelations } from "@/lib/types";
 import { formatAed, bedroomsLabel } from "@/lib/dubai";
@@ -13,8 +13,10 @@ import { Button } from "@/components/ui/button";
 import { UnitOfferDialog } from "@/components/offers/UnitOfferDialog";
 import { ProjectTeaserVideo } from "@/components/map/ProjectTeaserVideo";
 import { safeHttpUrl } from "@/lib/utils";
+import { useFiltersStore } from "@/store/filters";
+import { toast } from "sonner";
 
-export function ProjectPopup({ project, onClose }: { project: ProjectWithRelations | null; onClose: () => void }) {
+export function ProjectPopup({ project, onClose, onExploreTour }: { project: ProjectWithRelations | null; onClose: () => void; onExploreTour?: (projectId: string) => void }) {
   // Hero + gallery images (hero first, deduped) for the click-to-swap viewer.
   const images = useMemo(() => {
     // Signed URLs (private media bucket) — fall back to the stored value for
@@ -42,6 +44,7 @@ export function ProjectPopup({ project, onClose }: { project: ProjectWithRelatio
   const whatsapp = project ? whatsappUrl(project.name) : null;
   const mailto = project ? viewingMailto(project.name) : null;
   const [offerOpen, setOfferOpen] = useState(false);
+  const { compareProjectIds, toggleCompareProject } = useFiltersStore();
   const safeVideoUrl = safeHttpUrl(project?.video_url);
   const [teaserVisible, setTeaserVisible] = useState(Boolean(safeVideoUrl));
   // Reset the hero when a different project is selected.
@@ -220,6 +223,20 @@ export function ProjectPopup({ project, onClose }: { project: ProjectWithRelatio
                 )}
 
                 <div className="flex flex-wrap gap-2 pt-1">
+                  <Button type="button" size="sm" variant="outline" className="glass gold-hairline text-cream" onClick={() => {
+                    if (toggleCompareProject(project.id) === "full") toast.info("Compare up to three projects.");
+                  }}><GitCompareArrows className="mr-1 size-4" />{compareProjectIds.includes(project.id) ? "Remove" : "Compare"}</Button>
+                  <Button type="button" size="sm" variant="outline" className="glass gold-hairline text-cream" onClick={async () => {
+                    const url = new URL(window.location.href);
+                    url.searchParams.set("project", project.id);
+                    try {
+                      if (navigator.share) await navigator.share({ title: project.name, url: url.toString() });
+                      else { await navigator.clipboard.writeText(url.toString()); toast.success("Map link copied."); }
+                    } catch (error) {
+                      if (!(error instanceof DOMException && error.name === "AbortError")) toast.error("Could not share the link.");
+                    }
+                  }}><Share2 className="mr-1 size-4" />Share</Button>
+                  {onExploreTour && safeHttpUrl(project.tour_360_url) && <Button type="button" size="sm" className="shimmer bg-gold text-gold-foreground" onClick={() => onExploreTour(project.id)}>Explore 360°</Button>}
                   <Button asChild size="sm" className="shimmer bg-gold text-gold-foreground shadow-[0_0_0_rgba(201,168,76,0)] transition-shadow hover:bg-gold/90 hover:shadow-[0_6px_22px_rgba(201,168,76,0.45)]">
                     <Link to="/projects/$slug" params={{ slug: projectDetailSlug({ name: project.name, slug: project.slug }) }}>
                       View details <ArrowRight className="ml-1 h-3.5 w-3.5" />

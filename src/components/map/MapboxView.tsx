@@ -1990,8 +1990,7 @@ export function MapboxView({
       // the map and skew later recenter/clamp math.
       offset: window.innerWidth < 768 ? [0, -140] : [-190, 0],
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProjectId, active]);
+  }, [selectedProjectId, active, mapReady, projects, mode]);
 
   if (!accessToken) {
     return (
